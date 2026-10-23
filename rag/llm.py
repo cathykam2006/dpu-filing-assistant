@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace as NS
 
@@ -36,10 +37,12 @@ class Provider:
 
 PROVIDERS = {
     "groq": Provider("Groq", "GROQ_API_KEY", "console.groq.com/keys", "https://api.groq.com/openai/v1",
-                     context_tokens=3_000, batch_tokens=2_500, max_tokens=1_200, free=True,
+                     context_tokens=3_000, batch_tokens=2_000, max_tokens=1_000, free=True,
                      data_note="Excerpts are sent to Groq to generate results.",
                      # free tier: 8,000 tokens per minute, counting the requested output allowance
-                     history_turns=2, request_tokens=6_500, tool_tokens=3_500),
+                     # Groq counts the requested output allowance against the per-minute limit, so
+                     # reserve only what answers need; cut-off extractions are retried in halves
+                     history_turns=2, request_tokens=6_500, tool_tokens=2_500),
     "gemini": Provider("Google Gemini", "GEMINI_API_KEY", "aistudio.google.com/apikey",
                        "https://generativelanguage.googleapis.com/v1beta/openai/",
                        context_tokens=25_000, batch_tokens=10_000, max_tokens=3_000, free=True,
@@ -188,12 +191,31 @@ class _Stream:
                 yield chunk.choices[0].delta.content
 
 
+MAX_WAITS = 5
+on_wait = None          # set by the app: on_wait(seconds, provider_name) shows a "waiting" notice
+
+
+def retry_after(e: Exception, attempt: int) -> float:
+    """Seconds to wait: the Retry-After header, or 'try again in 12.5s' in the message, else back off."""
+    headers = getattr(getattr(e, "response", None), "headers", None) or {}
+    try:
+        return min(65.0, max(1.0, float(headers.get("retry-after"))))
+    except (TypeError, ValueError):
+        pass
+    m = re.search(r"try again in\s+(?:(\d+)m)?([\d.]+)(ms|s)", str(e))
+    if m:
+        secs = int(m.group(1) or 0) * 60 + float(m.group(2)) / (1000 if m.group(3) == "ms" else 1)
+        return min(65.0, max(1.0, secs + 0.5))
+    return min(30.0, 2.0 * 2 ** attempt)
+
+
 class OpenAICompat:
     def __init__(self, provider: str, key: str, client=None):
         self.provider = provider
         if client is None:
             from openai import OpenAI
-            client = OpenAI(api_key=key, base_url=PROVIDERS[provider].base_url, max_retries=4, timeout=120)
+            # retries are handled here (see _send) so waits for the free-tier limit can be shown
+            client = OpenAI(api_key=key, base_url=PROVIDERS[provider].base_url, max_retries=0, timeout=120)
         self._c = client
         self.messages = self
 
@@ -233,7 +255,7 @@ class OpenAICompat:
                                  else {"type": "function", "function": {"name": name}} if name else "auto")
             kw["messages"][0]["content"] += f"\n\nRecord your output by calling the `{tools[0]['name']}` tool."
         try:
-            resp = self._c.chat.completions.create(**kw)
+            resp = self._send(**kw)
         except Exception as e:
             gen = _failed_generation(e) if tools else None
             if gen is not None:                       # malformed tool call: keep what is complete
@@ -243,7 +265,7 @@ class OpenAICompat:
                 raise
             if tools and _is_bad_request(e):         # fall back to "auto" if forced choice is rejected
                 kw["tool_choice"] = "auto"
-                resp = self._c.chat.completions.create(**kw)
+                resp = self._send(**kw)
             else:
                 raise
         msg = resp.choices[0].message
@@ -265,7 +287,23 @@ class OpenAICompat:
 
     def stream(self, model, max_tokens, system, messages, **_):
         kw = self._fit(dict(model=model, max_tokens=max_tokens, messages=self._msgs(system, messages)))
-        return _Stream(self._c.chat.completions.create(stream=True, **kw, **self._extra(model)))
+        return _Stream(self._send(stream=True, **kw, **self._extra(model)))
+
+    def _send(self, **kw):
+        """Call the API; on a rate limit, wait as long as the provider asks (shown via on_wait) and retry."""
+        for attempt in range(MAX_WAITS + 1):
+            try:
+                return self._c.chat.completions.create(**kw)
+            except Exception as e:
+                if type(e).__name__ not in ("RateLimitError", "APIConnectionError", "APITimeoutError",
+                                            "InternalServerError") or attempt == MAX_WAITS:
+                    raise
+                if "Request too large" in str(e):          # waiting will not help
+                    raise
+                secs = retry_after(e, attempt)
+                if on_wait:
+                    on_wait(secs, PROVIDERS[self.provider].name)
+                time.sleep(secs)
 
 
 # --------------------------------------------------------------------------

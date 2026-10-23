@@ -212,3 +212,27 @@ def test_oversized_request_is_stopped_before_sending():
     assert fake.calls == []                                     # nothing was sent
     msg = llm.describe_error(llm.TooLarge("x"), "groq")
     assert "too large" in msg and "Search within" in msg
+
+
+def test_rate_limit_waits_are_shown_and_retried(monkeypatch):
+    waits, sleeps, calls = [], [], []
+
+    class RateLimitError(Exception):
+        def __init__(self):
+            super().__init__("Rate limit reached ... Please try again in 7.66s. Need more tokens?")
+            self.response = NS(headers={})
+
+    class Comp:
+        def create(self, **kw):
+            calls.append(kw)
+            if len(calls) < 3:
+                raise RateLimitError()
+            return NS(choices=[NS(message=NS(content="ok", tool_calls=None))])
+
+    monkeypatch.setattr(llm.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(llm, "on_wait", lambda s, name: waits.append((round(s, 2), name)))
+    out = llm.OpenAICompat("groq", "k", client=NS(chat=NS(completions=Comp()))).create(
+        model="m", max_tokens=100, system="s", messages=[{"role": "user", "content": "hi"}])
+    assert out.content[0].text == "ok" and len(calls) == 3
+    assert waits == [(8.16, "Groq"), (8.16, "Groq")] and sleeps == [8.16, 8.16]
+    assert llm.retry_after(NS(response=NS(headers={"retry-after": "12"})), 0) == 12.0

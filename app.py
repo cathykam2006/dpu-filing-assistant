@@ -139,6 +139,20 @@ st.caption("Drag in public filings (GAF/PGAF/OGAF, LDAF, rate cases, information
            "Ask questions, pull key figures with automatic checks, draft information requests, "
            "track responses and compare filings. Everything cites the file and page it came from.")
 
+@st.cache_data(max_entries=24, ttl=3 * 3600, show_spinner=False)
+def read_file(name: str, data: bytes, _progress=None):
+    """Read a file once: re-uploads, sample buttons and page refreshes reuse the result (keyed by content)."""
+    return ingest.load(name, data, _progress)
+
+
+def load_with_progress(name: str, data: bytes):
+    bar = st.progress(0.0, text=f"Reading {name} …")
+    try:
+        return read_file(name, data, lambda i, n: bar.progress(i / n, text=f"Reading {name}: page {i} of {n}"))
+    finally:
+        bar.empty()
+
+
 files = st.file_uploader("Drop filings here", type=[e.lstrip(".") for e in ingest.SUPPORTED],
                          accept_multiple_files=True, key=f"upload_{ss.upload_key}")
 current = set()
@@ -151,11 +165,10 @@ for f in files or []:
     if len(data) > MAX_MB * 1e6:
         st.warning(f"{f.name}: larger than {MAX_MB} MB, skipped.")
         continue
-    with st.spinner(f"Reading {f.name} …"):
-        try:
-            ss.docs[h] = ingest.load(f.name, data)
-        except Exception as e:
-            st.error(f"{f.name}: could not be read ({e}).")
+    try:
+        ss.docs[h] = load_with_progress(f.name, data)
+    except Exception as e:
+        st.error(f"{f.name}: could not be read ({e}).")
 
 if ss.use_samples or ss.use_real:
     for pth in sorted(SAMPLES.glob("*.*")):
@@ -167,7 +180,7 @@ if ss.use_samples or ss.use_real:
         h = hashlib.sha1(data).hexdigest()
         current.add(h)
         if h not in ss.docs:
-            ss.docs[h] = ingest.load(pth.name, data)
+            ss.docs[h] = load_with_progress(pth.name, data)
 
 # files removed from the uploader are dropped from the session
 ss.docs = {h: d for h, d in ss.docs.items() if h in current}
@@ -220,6 +233,8 @@ def run_ai(fn, cost: int = 1):
     client = get_client(cost)
     if client is None:
         return None
+    llm.on_wait = lambda secs, name: st.toast(f"Waiting {secs:.0f} s for {name}'s free-tier per-minute limit, "
+                                              "then continuing …", icon="⏳")
     try:
         out = fn(client)
     except Exception as e:      # every provider SDK raises its own classes
@@ -260,10 +275,24 @@ def baseline_budget(p) -> int:
     return p.request_tokens - p.max_tokens - 800 if p.request_tokens else p.context_tokens * 3
 
 
+def checks_for(names: list[str], figs: list) -> dict:
+    """Formula checks, coverage and issues for the selected filings, computed once per selection."""
+    memo = ss.setdefault("_checks", {})
+    key = (tuple(names), MODE, len(figs), ss.get("index_key"))
+    if key not in memo:
+        picked = [by_name[n][1] for n in names]
+        fchecks = verify.formula_checks(picked)
+        issues = sorted(discovery.run_checks(figs) + verify.formula_issues(fchecks),
+                        key=lambda i: {"high": 0, "medium": 1, "low": 2}[i.severity])
+        memo.clear()
+        memo[key] = {"fchecks": fchecks, "issues": issues, "cov": verify.coverage(picked, figs),
+                     "df": discovery.figures_frame(figs)}
+    return memo[key]
+
+
 def all_issues(names: list[str], figs: list) -> list:
     """Figure checks plus schedule formula checks, most severe first."""
-    found = discovery.run_checks(figs) + verify.formula_issues(verify.formula_checks([by_name[n][1] for n in names]))
-    return sorted(found, key=lambda i: {"high": 0, "medium": 1, "low": 2}[i.severity])
+    return checks_for(names, figs)["issues"]
 
 
 def show_number_checks(checks: list):
@@ -387,7 +416,8 @@ with tabs[0]:
                            file_name=f"dpu_filing_qa_{datetime.now():%Y%m%d_%H%M}.txt")
 
 # ================================================================== Key figures
-with tabs[1]:
+@st.fragment
+def _tab_key_figures():
     if AI:
         st.markdown(f"**{model_label}** reads each filing and records every key figure (GAF, LDAF, cost-of-gas "
                     "components, reconciliation, sales, bill impacts) with the exact sentence it came from. "
@@ -407,11 +437,8 @@ with tabs[1]:
         if pick and (done or st.button("Extract key figures", type="primary")):
             figs = figures_for(pick)
             if figs:
-                picked_docs = [by_name[n][1] for n in pick]
-                fchecks = verify.formula_checks(picked_docs)
-                issues = all_issues(pick, figs)
-                cov = verify.coverage(picked_docs, figs)
-                df = discovery.figures_frame(figs)
+                ck = checks_for(pick, figs)
+                fchecks, issues, cov, df = ck["fchecks"], ck["issues"], ck["cov"], ck["df"]
                 n_ok = int(df["verified"].sum())
                 n_tie = int((fchecks["Result"] != "✗ does not tie").sum())
                 n_cov = int(cov["In figures table"].sum())
@@ -463,8 +490,13 @@ with tabs[1]:
                 st.download_button("Download figures (CSV)", show.to_csv(index=False).encode(),
                                    file_name="key_figures.csv")
 
+
+with tabs[1]:
+    _tab_key_figures()
+
 # ================================================================== Draft IRs
-with tabs[2]:
+@st.fragment
+def _tab_draft_irs():
     st.warning("Draft information requests are a starting point for staff review, built from public "
                "filings for demonstration. Edit before use; issuing discovery follows DPU procedure. "
                "Drafts are marked DRAFT and carry no seal or letterhead.")
@@ -522,6 +554,8 @@ with tabs[2]:
                                       own_docket=meta.docket)
             if out is not None:
                 ss.irs = out
+        if ss.get("flash"):
+            st.success(ss.flash + " They are at the end of the table below.")
         if not AI:
             st.caption("No-AI mode: requests are templates filled from the automatic checks and the figures "
                        "found (reconcile this total, explain this change, provide workpapers for this "
@@ -544,14 +578,21 @@ with tabs[2]:
                 st.text(irformat.to_text(edited, meta))
             stem = f"DPU_{meta.docket or 'docket'}_{meta.ordinal.title()}_Set_IRs_DRAFT".replace(" ", "_")
             d1, d2, d3 = st.columns(3)
-            d1.download_button("Word (.docx), Department format", irformat.to_docx(edited, meta),
-                               file_name=f"{stem}.docx")
+            vkey = hashlib.sha1((edited.to_json() + repr(meta)).encode()).hexdigest()
+            if ss.get("_docx", (None,))[0] != vkey:
+                ss._docx = (vkey, irformat.to_docx(edited, meta))
+            d1.download_button("Word (.docx), Department format", ss._docx[1], file_name=f"{stem}.docx")
             d2.download_button("Text", irformat.to_text(edited, meta).encode(), file_name=f"{stem}.txt")
             d3.download_button("CSV with rationale and sources", edited.to_csv(index=False).encode(),
                                file_name=f"{stem}.csv")
 
+
+with tabs[2]:
+    _tab_draft_irs()
+
 # ================================================================== Track responses
-with tabs[3]:
+@st.fragment
+def _tab_track_responses():
     st.markdown("Upload the company's responses. Each IR is checked for whether it answers what was asked, "
                 "which attachments it relies on (and whether you've uploaded them), and what to follow up on.")
     resp_docs = [d for d in docs if any(c.ir for c in d.chunks)]
@@ -588,6 +629,8 @@ with tabs[3]:
                 col.metric(s.capitalize(), n)
             st.dataframe(g, hide_index=True, width="stretch")
             follow = g[g["Suggested follow-up"].astype(bool)]
+            if ss.get("flash"):
+                st.success(ss.flash + " Open the Draft IRs tab to edit them.")
             if len(follow) and st.button(f"Add {len(follow)} follow-up requests to the Draft IRs tab"):
                 m = ir_meta()
                 start = len(ss.irs) + 1 if ss.irs is not None else 1
@@ -598,12 +641,18 @@ with tabs[3]:
                         str(r["Suggested follow-up"])),
                     "Why": f"{r['Status']}: {r['Gaps']}".strip(": "), "Based on": r["Where"]}
                     for i, (_, r) in enumerate(follow.iterrows())], columns=irformat.COLS)
-                st.success(f"Added {add_to_drafts(new)} requests. Open the Draft IRs tab to edit them.")
+                ss.flash = f"Added {add_to_drafts(new)} follow-up requests from Track responses."
+                st.rerun()
             st.download_button("Download tracker (CSV)", g.to_csv(index=False).encode(),
                                file_name="ir_response_tracker.csv")
 
+
+with tabs[3]:
+    _tab_track_responses()
+
 # ================================================================== Compare
-with tabs[4]:
+@st.fragment
+def _tab_compare():
     st.markdown("Pick last year's filing and this year's. Figures are extracted from both and matched by "
                 "metric and rate class, so every change is shown with the page each number came from.")
     names = [d.name for d in docs]
@@ -627,8 +676,13 @@ with tabs[4]:
                 st.download_button("Download comparison (CSV)", cmp.to_csv(index=False).encode(),
                                    file_name="filing_comparison.csv")
 
+
+with tabs[4]:
+    _tab_compare()
+
 # ================================================================== Compliance
-with tabs[5]:
+@st.fragment
+def _tab_compliance():
     st.markdown("Drop in the **Department's order**, a **prior order**, or the filing's **cover letter**. "
                 "Each directive, approved value, required schedule or attachment and deadline is pulled out "
                 "and checked against the filing above. Values, schedules, attachments and dates are checked by "
@@ -646,7 +700,7 @@ with tabs[5]:
         cur_o.add(h)
         if h not in ss.orders:
             try:
-                ss.orders[h] = ingest.load(f.name, data)
+                ss.orders[h] = load_with_progress(f.name, data)
             except Exception as e:
                 st.error(f"{f.name}: could not be read ({e}).")
     if ss.use_sample_order:
@@ -655,7 +709,7 @@ with tabs[5]:
             h = hashlib.sha1(data).hexdigest()
             cur_o.add(h)
             if h not in ss.orders:
-                ss.orders[h] = ingest.load(pth.name, data)
+                ss.orders[h] = load_with_progress(pth.name, data)
     ss.orders = {h: d for h, d in ss.orders.items() if h in cur_o}
     order_docs = list(ss.orders.values())
     if not order_docs:
@@ -718,16 +772,24 @@ with tabs[5]:
             c1, c2 = st.columns(2)
             c1.download_button("Download compliance table (CSV)", cdf.to_csv(index=False).encode(),
                                file_name="compliance_check.csv")
+            if ss.get("flash"):
+                c2.success(ss.flash + " Open the Draft IRs tab to edit them.")
             if c2.button("Add follow-up IRs for every gap to the Draft IRs tab"):
                 m = ir_meta()
                 refs = {d.name: compliance.order_reference(d) for d in order_docs}
                 filing_ref = next(iter((ss.get("ir_refs") or {}).values()), "the Company’s filing")
                 new = compliance.follow_up_irs(cdf, m.prefix, m.set_no,
                                                (len(ss.irs) if ss.irs is not None else 0) + 1, refs, filing_ref)
-                st.success(f"Added {add_to_drafts(new)} draft requests. Open the Draft IRs tab to edit them.")
+                ss.flash = f"Added {add_to_drafts(new)} follow-up requests from the compliance check."
+                st.rerun()
+
+
+with tabs[5]:
+    _tab_compliance()
 
 # ================================================================== Evaluation
-with tabs[6]:
+@st.fragment
+def _tab_evaluation():
     st.markdown("How often is the assistant right? Load a question set with known answers "
                 "(a CSV: `id, question, files, expected_values, expected_location`), then score "
                 "retrieval (free) or full answers and citations, optionally against a whole-document "
@@ -780,4 +842,10 @@ with tabs[6]:
         st.download_button("Download results (CSV)", ss.eval.to_csv(index=False).encode(),
                            file_name="evaluation_results.csv")
 
+
+with tabs[6]:
+    _tab_evaluation()
+
 counter.caption(f"AI requests this session: {ss.asked}" + (f" / {MAX_Q}" if OWNER_KEY else ""))
+
+ss.pop("flash", None)        # shown once, on the full rerun after the action

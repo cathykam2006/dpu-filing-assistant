@@ -113,7 +113,7 @@ question → keyword search (BM25) tuned for docket/IR numbers, rate classes and
 | `rag/evaluate.py`, `eval/` | Question sets, scoring, baseline, reports |
 | `app.py` | Streamlit interface: upload, Ask, Key figures, Draft IRs, Track responses, Compare, Evaluation |
 | `samples/` | Fictional sample filings (`make_samples.py` regenerates them) |
-| `tests/` | 68 tests on ingestion, search, prompts, discovery, scoring, the Groq/Gemini adapter, no-AI mode, verification, compliance checks and the IR format (the API is faked, so tests are free) |
+| `tests/` | 69 tests on ingestion, search, prompts, discovery, scoring, the Groq/Gemini adapter, no-AI mode, verification, compliance checks and the IR format (the API is faked, so tests are free) |
 
 Scanned PDFs without a text layer are flagged; run OCR first for those pages to be searchable.
 
@@ -132,6 +132,14 @@ streamlit run app.py
 2. On share.streamlit.io, create an app from the repo with main file `app.py`.
 3. In **App settings → Secrets**, add any of `GROQ_API_KEY` (free, console.groq.com/keys), `GEMINI_API_KEY` or `ANTHROPIC_API_KEY`. You can also add none, and the app runs in no-AI mode. Optional: `DEFAULT_MODEL`, `APP_PASSWORD`, `MAX_QUESTIONS` (see `.streamlit/secrets.toml.example`). `MAX_QUESTIONS` caps AI requests per session on your keys. Visitors who paste their own key are not capped.
 4. For a paid key (Anthropic), set a monthly spend limit in the provider's console.
+
+## Speed
+
+- **Reading PDFs:** prose pages (testimony, letters, IR responses) use pdfium, which is fast. Pages with tables or schedules use pdfplumber, which keeps every value in its row and column. A 240-page prose-heavy filing reads in about 5 seconds instead of 15, and schedule pages are read exactly as before.
+- **Each file is read once.** Re-uploads, the sample buttons and page refreshes reuse the result, and a progress bar shows the pages being read.
+- **Only the tab you're using reruns** (Streamlit fragments). Checks, coverage and the Word file are computed once per selection, not on every click.
+- **Groq's free tier allows about 8,000 tokens a minute**, counting the answer room each request reserves. The app reserves only what answers need, and when Groq asks it to wait, it shows "Waiting … s for Groq's free-tier per-minute limit" and continues by itself. For long filings, Gemini or Claude are faster.
+- **Streamlit Community Cloud** puts an app to sleep after a period with no visitors, so the first visit afterward takes a minute or so to wake it.
 
 ## Troubleshooting
 

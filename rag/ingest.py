@@ -70,7 +70,7 @@ class Document:
 # helpers
 # --------------------------------------------------------------------------
 def _clean(text: str) -> str:
-    text = text.replace("\x00", " ")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]", " ", text.replace("\x02", "-"))
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -144,18 +144,58 @@ def split_by_ir(text: str) -> list[tuple[str | None, str]]:
 # --------------------------------------------------------------------------
 # readers
 # --------------------------------------------------------------------------
-def read_pdf(name: str, data: bytes) -> Document:
+NUMERIC_LINE = re.compile(r"(?:\$\s?\(?\d|\b\d[\d,]*\.\d+\b|\b\d{1,3}(?:,\d{3})+\b)")
+
+
+def needs_layout(text: str, n_paths: int) -> bool:
+    """Pages where reading order by position matters: schedules and tables (rows of numbers, a rate-class
+    header, or drawn ruling lines). Prose pages can use the fast reader; its text is the same."""
+    if n_paths >= 6 or header_line(text):
+        return True
+    rows = sum(1 for ln in text.splitlines() if len(NUMERIC_LINE.findall(ln)) >= 3)
+    return rows >= 2
+
+
+def _fast_pages(data: bytes):
+    """Per page: (text, number of drawn path objects) from pdfium; None if pdfium cannot open the file."""
+    try:
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as raw
+        doc = pdfium.PdfDocument(data)
+    except Exception:
+        return None
+    out = []
+    for i in range(len(doc)):
+        try:
+            page = doc[i]
+            text = page.get_textpage().get_text_range().replace("\r\n", "\n").replace("\r", "\n")
+            paths = sum(1 for _ in page.get_objects(filter=[raw.FPDF_PAGEOBJ_PATH], max_depth=2))
+        except Exception:
+            text, paths = None, 99                       # force the careful reader for this page
+        out.append((text, paths))
+    return out
+
+
+def read_pdf(name: str, data: bytes, progress=None) -> Document:
+    """Prose pages are read with pdfium (fast); pages with tables or schedules with pdfplumber, which keeps
+    each value in its row and column. progress(done, total) is called after every page."""
     import pdfplumber
 
     chunks, all_text, pages, empty, page_texts = [], [], 0, 0, []
     current_ir = None
+    fast = _fast_pages(data)
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         pages = len(pdf.pages)
         for i, page in enumerate(pdf.pages, start=1):
-            try:
-                text = page.extract_text() or ""
-            except Exception:
-                text = ""
+            quick = fast[i - 1] if fast and i <= len(fast) else (None, 99)
+            careful = quick[0] is None or needs_layout(_clean(quick[0]), quick[1])
+            if careful:
+                try:
+                    text = page.extract_text() or ""
+                except Exception:
+                    text = ""
+            else:
+                text = quick[0]
             text = _clean(text)
             if not text:
                 empty += 1
@@ -165,16 +205,19 @@ def read_pdf(name: str, data: bytes) -> Document:
                 current_ir = ir or current_ir
                 for piece in with_header(_split(part), text):   # every piece of a schedule keeps its columns
                     chunks.append(Chunk(piece, name, f"p. {i}", page=i, ir=current_ir))
-            try:
-                for t in page.extract_tables() or []:
-                    rows = [" | ".join(str(c or "").strip() for c in r) for r in t if any(r)]
-                    if len(rows) >= 2:
-                        body = "\n".join(rows)
-                        for piece in _split(body):
-                            chunks.append(Chunk(piece, name, f"p. {i} (table)", page=i,
-                                                ir=current_ir, kind="table"))
-            except Exception:
-                pass
+            if careful:
+                try:
+                    for t in page.extract_tables() or []:
+                        rows = [" | ".join(str(c or "").strip() for c in r) for r in t if any(r)]
+                        if len(rows) >= 2:
+                            body = "\n".join(rows)
+                            for piece in _split(body):
+                                chunks.append(Chunk(piece, name, f"p. {i} (table)", page=i,
+                                                    ir=current_ir, kind="table"))
+                except Exception:
+                    pass
+            if progress:
+                progress(i, pages)
     joined = "\n".join(all_text)
     warning = None
     if pages and empty / pages > 0.5:
@@ -262,11 +305,11 @@ READERS = {".pdf": read_pdf, ".xlsx": read_excel, ".xlsm": read_excel, ".xls": r
 SUPPORTED = sorted(READERS)
 
 
-def load(name: str, data: bytes) -> Document:
+def load(name: str, data: bytes, progress=None) -> Document:
     ext = Path(name).suffix.lower()
     if ext not in READERS:
         raise ValueError(f"Unsupported file type {ext}. Supported: {', '.join(SUPPORTED)}")
-    doc = READERS[ext](name, data)
+    doc = READERS[ext](name, data, progress) if ext == ".pdf" else READERS[ext](name, data)
     if not doc.chunks and not doc.warning:
         doc.warning = "No text could be extracted from this file."
     return doc
