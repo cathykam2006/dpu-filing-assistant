@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from rag import answer, discovery, evaluate, ingest, search
+from rag import answer, discovery, evaluate, ingest, llm, rules, search
 
 st.set_page_config(page_title="DPU Filing Assistant", page_icon="📑", layout="wide")
 
@@ -66,13 +66,35 @@ if not ss.unlocked:
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.header("Settings")
-    key = secret("ANTHROPIC_API_KEY")
-    OWNER_KEY = bool(key)           # the session limit only applies to the app owner's key
-    if not key:
-        key = st.text_input("Anthropic API key", type="password",
-                            help="Create one at console.anthropic.com. It stays in this browser session.")
-    model_label = st.selectbox("Model", list(answer.MODELS), index=list(answer.MODELS).index(answer.DEFAULT_MODEL))
-    model = answer.MODELS[model_label]
+    MODELS = dict(llm.MODELS)
+    for prov, override in (("groq", secret("GROQ_MODEL")), ("gemini", secret("GEMINI_MODEL"))):
+        if override:
+            MODELS = {k: (p_, override if p_ == prov else m) for k, (p_, m) in MODELS.items()}
+    owner_keys = {p_: secret(P.key_name) for p_, P in llm.PROVIDERS.items()}
+    options = list(MODELS) + [llm.NO_AI]
+    default = secret("DEFAULT_MODEL")
+    if default not in options:
+        default = next((lbl for prov in llm.PREFERENCE if owner_keys[prov]
+                        for lbl, (p_, _) in MODELS.items() if p_ == prov), llm.NO_AI)
+    model_label = st.selectbox("AI model", options, index=options.index(default),
+                               help="Free options run on Groq or Google's free tiers. "
+                                    "'No AI' keeps search and the arithmetic checks working without any key.")
+    if model_label == llm.NO_AI:
+        provider, model, P, key, OWNER_KEY = None, "rules", None, None, False
+    else:
+        provider, model = MODELS[model_label]
+        P = llm.PROVIDERS[provider]
+        key = owner_keys[provider]
+        OWNER_KEY = bool(key)       # the session limit only applies to the app owner's key
+        if not key:
+            key = st.text_input(f"{P.name} API key", type="password",
+                                help=f"{'Free key' if P.free else 'Create one'} at {P.key_url}. "
+                                     "It stays in this browser session.")
+            if not key:
+                st.info(f"No {P.name} key, so the app runs in no-AI mode: search, figures from tables "
+                        "and text patterns, checks, template IRs and comparisons still work.")
+    AI = bool(key)
+    MODE = model if AI else "rules"     # cache key for extracted figures
     counter = st.empty()
     if st.button("Clear documents and results", width="stretch"):
         for k in ("docs", "figs"):
@@ -82,8 +104,8 @@ with st.sidebar:
         st.rerun()
     st.divider()
     st.markdown("**Public filings only.** Uploaded files are processed in memory for this session "
-                "and are not stored. Text from the filings is sent to the Anthropic API to generate "
-                "results. Do not upload confidential or redacted material.")
+                "and are not stored. " + (P.data_note if AI else "In no-AI mode nothing leaves the app.")
+                + " Do not upload confidential or redacted material.")
     st.caption("Created by Cathy Kam")
 
 # ------------------------------------------------------------------ upload
@@ -153,14 +175,13 @@ index = ss.get("index") if docs else None
 # ------------------------------------------------------------------ helpers
 def get_client(cost: int = 1):
     """Return an API client, or show why not and return None."""
-    if not key:
-        st.error("Add an Anthropic API key in the sidebar (or the ANTHROPIC_API_KEY secret).")
+    if not AI:
+        st.error("Choose a model and add its key in the sidebar.")
         return None
     if OWNER_KEY and ss.asked + cost > MAX_Q:
-        st.error(f"Request limit for this session reached ({MAX_Q}).")
+        st.error(f"Request limit for this session reached ({MAX_Q}). Switch to 'No AI' to keep exploring.")
         return None
-    import anthropic
-    return anthropic.Anthropic(api_key=key)
+    return llm.make_client(provider, key)
 
 
 def run_ai(fn, cost: int = 1):
@@ -168,31 +189,31 @@ def run_ai(fn, cost: int = 1):
     client = get_client(cost)
     if client is None:
         return None
-    import anthropic
     try:
         out = fn(client)
-    except anthropic.AuthenticationError:
-        st.error("The API key was rejected. Check it in the sidebar.")
-        return None
-    except anthropic.APIError as e:
-        st.error(f"The AI service returned an error: {e}")
+    except Exception as e:      # every provider SDK raises its own classes
+        st.error(llm.describe_error(e, provider))
         return None
     ss.asked += cost
     return out
 
 
 def figures_for(names: list[str]) -> list:
-    """Extract figures for each named file once per model, reusing earlier results."""
-    todo = [n for n in names if (by_name[n][0], model) not in ss.figs]
-    for n in todo:
+    """Extract figures for each named file once per model (or once by rules), reusing results."""
+    for n in [n for n in names if (by_name[n][0], MODE) not in ss.figs]:
         h, d = by_name[n]
-        cost = max(1, len(discovery._batches([c for c in d.chunks if discovery.has_numbers(c)])))
+        if not AI:
+            ss.figs[(h, MODE)] = rules.extract_figures(d.chunks)
+            continue
+        numeric = [c for c in d.chunks if discovery.has_numbers(c)]
+        cost = max(1, len(discovery._batches(numeric, P.batch_chars)))
         with st.spinner(f"Extracting figures from {n} …"):
-            out = run_ai(lambda client: discovery.extract_figures(client, model, d.chunks), cost)
+            out = run_ai(lambda client: discovery.extract_figures(
+                client, model, d.chunks, max_chars=P.batch_chars, max_tokens=P.max_tokens), cost)
         if out is None:
             break
-        ss.figs[(h, model)] = out
-    return [f for n in names for f in ss.figs.get((by_name[n][0], model), [])]
+        ss.figs[(h, MODE)] = out
+    return [f for n in names for f in ss.figs.get((by_name[n][0], MODE), [])]
 
 
 def docx_bytes(title: str, df: pd.DataFrame) -> bytes:
@@ -254,16 +275,29 @@ with tabs[0]:
     if question:
         with st.chat_message("user"):
             st.markdown(md(question))
-        hits = index.search(question, files=scope or None)
+        if AI:
+            hits = index.search(question, files=scope or None, max_chars=P.context_chars)
+        else:
+            hits = sorted(index.search(question, k=3, files=scope or None, always_rank=True),
+                          key=lambda h: -h[1])[:3]
         with st.chat_message("assistant"):
             if not hits:
                 reply, sources = "I couldn't find anything relevant in the selected files.", []
                 st.markdown(reply)
+            elif not AI:
+                parts = ["No AI model is selected, so here are the most relevant passages. "
+                         "Choose a model in the sidebar for a written, cited answer."]
+                for n, (c, _) in enumerate(hits, start=1):
+                    body = c.text if len(c.text) <= 900 else c.text[:900] + "…"
+                    quoted = "\n".join("> " + ln for ln in rules.highlight(body, question).splitlines() if ln.strip())
+                    parts.append(f"**{n}. {c.citation()}**\n\n{quoted}")
+                reply, sources = "\n\n".join(parts), []
+                st.markdown(md(reply))
             else:
                 def ask(client):
                     stream, srcs = answer.stream_answer(
                         client, model, question, hits,
-                        [{"role": t["role"], "content": t["content"]} for t in ss.chat])
+                        [{"role": t["role"], "content": t["content"]} for t in ss.chat], P.max_tokens)
                     return st.write_stream(md_stream(stream)).replace("\\$", "$"), srcs
                 out = run_ai(ask)
                 if out is None:
@@ -286,17 +320,22 @@ with tabs[0]:
 
 # ================================================================== Key figures
 with tabs[1]:
-    st.markdown("Claude reads each filing and records every key figure (GAF, LDAF, cost-of-gas components, "
-                "reconciliation, sales, bill impacts) with the exact sentence it came from. The app then "
-                "checks each quote against the page, ties components to totals and flags large changes "
-                "and missing items. The checks are plain arithmetic, not AI.")
+    if AI:
+        st.markdown(f"**{model_label}** reads each filing and records every key figure (GAF, LDAF, cost-of-gas "
+                    "components, reconciliation, sales, bill impacts) with the exact sentence it came from. "
+                    "The app then checks each quote against the page, ties components to totals and flags "
+                    "large changes and missing items. The checks are plain arithmetic, not AI.")
+    else:
+        st.markdown("**No-AI mode:** figures are read from table rows and standard wording "
+                    "(\"commodity costs of \\$…\", \"GAF is \\$… per therm\"). This is dependable on tables and "
+                    "weaker on free-form prose. The checks are the same arithmetic as with a model.")
     if not docs:
         st.info("Upload filings first.")
     else:
         pick = st.multiselect("Filings", [d.name for d in docs],
                               default=[d.name for d in docs if d.doc_type != "Information request response"]
                               or [d.name for d in docs], key="fig_files")
-        done = all((by_name[n][0], model) in ss.figs for n in pick)
+        done = all((by_name[n][0], MODE) in ss.figs for n in pick)
         if pick and (done or st.button("Extract key figures", type="primary")):
             figs = figures_for(pick)
             if figs:
@@ -351,11 +390,20 @@ with tabs[2]:
                 figs = figures_for(target)
                 issues = discovery.run_checks(figs) if figs else []
             chunks_t = [c for n in target for c in by_name[n][1].chunks]
-            with st.spinner("Drafting …"):
-                out = run_ai(lambda client: discovery.draft_irs(client, model, chunks_t, issues, prefix,
-                                                                int(set_no), int(n_req)))
+            if AI:
+                with st.spinner("Drafting …"):
+                    out = run_ai(lambda client: discovery.draft_irs(
+                        client, model, chunks_t, issues, prefix, int(set_no), int(n_req),
+                        max_chars=P.context_chars, max_tokens=P.max_tokens))
+            else:
+                out = rules.draft_irs(figures_for(target), issues, " ".join(c.text for c in chunks_t),
+                                      prefix, int(set_no), int(n_req))
             if out is not None:
                 ss.irs = out
+        if not AI:
+            st.caption("No-AI mode: requests are templates filled from the automatic checks and the figures "
+                       "found (reconcile this total, explain this change, provide workpapers for this "
+                       "component). A model writes requests tailored to the filing's content.")
         if ss.irs is not None and len(ss.irs):
             st.caption("Edit directly in the table; downloads use your edits.")
             edited = st.data_editor(ss.irs, hide_index=True, width="stretch", num_rows="dynamic",
@@ -385,12 +433,20 @@ with tabs[3]:
         if pick and st.button("Review responses", type="primary"):
             chunks_r = [c for n in pick for c in by_name[n][1].chunks]
             n_ir = len(discovery.ir_groups(chunks_r))
-            with st.spinner(f"Reviewing {n_ir} responses …"):
-                out = run_ai(lambda client: discovery.grade_responses(
-                    client, model, chunks_r, [d.name for d in docs], drafted if check_drafts else None),
-                    cost=max(1, -(-n_ir // 12)))
+            if AI:
+                n_calls = len(discovery.ir_batches(discovery.ir_groups(chunks_r), P.batch_chars))
+                with st.spinner(f"Reviewing {n_ir} responses …"):
+                    out = run_ai(lambda client: discovery.grade_responses(
+                        client, model, chunks_r, [d.name for d in docs], drafted if check_drafts else None,
+                        max_chars=P.batch_chars, max_tokens=P.max_tokens), cost=max(1, n_calls))
+            else:
+                out = rules.grade_responses(chunks_r, [d.name for d in docs], drafted if check_drafts else None)
             if out is not None:
                 ss.grades = out
+        if not AI:
+            st.caption("No-AI mode: responses are checked for objections, deferred answers, attachments "
+                       "not uploaded and very short answers. Whether a response fully answers the "
+                       "question needs a model (or a person).")
         if ss.grades is not None and len(ss.grades):
             g = ss.grades
             counts = g["Status"].value_counts()
@@ -420,7 +476,7 @@ with tabs[4]:
         cur = c2.selectbox("Current filing", names, index=1)
         if prior == cur:
             st.warning("Choose two different filings.")
-        elif st.button("Compare", type="primary") or all((by_name[n][0], model) in ss.figs for n in (prior, cur)):
+        elif st.button("Compare", type="primary") or all((by_name[n][0], MODE) in ss.figs for n in (prior, cur)):
             figs = figures_for([prior, cur])
             if figs:
                 cmp = discovery.compare(figs, prior, cur)
@@ -454,6 +510,10 @@ with tabs[5]:
     c1, c2, c3 = st.columns(3)
     k = c1.number_input("Passages per question (k)", 2, 30, 8)
     base = c2.checkbox("Include whole-document baseline", value=True)
+    if AI and P.free:
+        st.caption(f"{P.name}'s free tier has a per-minute token limit, so scoring runs slowly and the "
+                   f"baseline is capped at {min(evaluate.BASELINE_CHARS, P.context_chars * 2):,} characters "
+                   "of each filing.")
     st.download_button("Template for scoring ChatGPT / Claude.ai by hand",
                        evaluate.manual_template(qs).encode(), file_name="manual_comparison.csv")
     if runnable:
@@ -462,11 +522,14 @@ with tabs[5]:
         if b1.button("Score retrieval (free)"):
             ss.eval = evaluate.results_frame(evaluate.run(runnable, all_chunks, k=int(k)))
         cost = len(runnable) * (2 if base else 1)
-        if b2.button(f"Score answers ({cost} API requests)", type="primary",
-                     help="Uses your own API key; on the shared demo key this may exceed the session limit."):
+        if b2.button(f"Score answers ({cost} API requests)", type="primary", disabled=not AI,
+                     help="Needs a model. Uses your own API key; on the shared demo key this may exceed "
+                          "the session limit."):
             bar = st.progress(0.0)
             res = run_ai(lambda client: evaluate.run(
                 runnable, all_chunks, client=client, model=model, k=int(k), baseline=base,
+                max_chars=P.context_chars, max_tokens=P.max_tokens,
+                baseline_chars=min(evaluate.BASELINE_CHARS, P.context_chars * 2),
                 progress=lambda i, n, q: bar.progress(i / n, text=f"{q.id}: {q.question[:60]}")), cost)
             if res is not None:
                 ss.eval = evaluate.results_frame(res)

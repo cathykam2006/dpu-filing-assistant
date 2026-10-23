@@ -172,21 +172,36 @@ verbatim from the source so it can be checked automatically. Do not compute, inf
 numbers, dates, docket numbers and line numbers."""
 
 
-def extract_figures(client, model: str, chunks: list[Chunk]) -> list[Figure]:
+def _to_float(v) -> float | None:
+    """Open models sometimes return numbers as strings ("$1,234", "7.9%")."""
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).replace("$", "").replace(",", "").replace("%", "").strip())
+    except ValueError:
+        return None
+
+
+def extract_figures(client, model: str, chunks: list[Chunk], max_chars: int = 60_000,
+                    max_tokens: int = 4000) -> list[Figure]:
     numeric = [c for c in chunks if has_numbers(c)]
     figures: list[Figure] = []
-    for batch in _batches(numeric):
+    for batch in _batches(numeric, max_chars):
         out = _call_tool(client, model, EXTRACT_SYSTEM,
-                         f"Filing excerpts:\n\n{_sources_block(batch)}", FIGURE_TOOL)
-        for f in out.get("figures", []):
-            sid = int(f.get("source_id", 0))
-            if not 1 <= sid <= len(batch):
+                         f"Filing excerpts:\n\n{_sources_block(batch)}", FIGURE_TOOL, max_tokens)
+        for f in out.get("figures", []) or []:
+            if not isinstance(f, dict):
                 continue
+            sid, val = _to_float(f.get("source_id", 0)), _to_float(f.get("value"))
+            if sid is None or val is None or not 1 <= int(sid) <= len(batch):
+                continue
+            sid = int(sid)
             src = batch[sid - 1]
-            fig = Figure(metric=f.get("metric", "other"), label=f.get("label", ""),
-                         value=float(f.get("value", 0)), unit=f.get("unit", ""),
+            metric = f.get("metric", "other")
+            fig = Figure(metric=metric if metric in METRICS else "other", label=str(f.get("label", "")),
+                         value=val, unit=str(f.get("unit", "")),
                          rate_class=f.get("rate_class", "") or "", period=f.get("period", "") or "",
-                         status=f.get("status", "") or "", quote=f.get("quote", ""),
+                         status=f.get("status", "") or "", quote=str(f.get("quote", "")),
                          source_id=sid, file=src.file, location=src.location)
             fig.verified = verify(fig, src.text)
             if not fig.verified:
@@ -195,7 +210,11 @@ def extract_figures(client, model: str, chunks: list[Chunk]) -> list[Figure]:
                 if alt is not None:
                     fig.file, fig.location, fig.verified = alt.file, alt.location, True
             figures.append(fig)
-    # the same figure is often in a table and the text; keep one, preferring verified
+    return dedupe(figures)
+
+
+def dedupe(figures: list[Figure]) -> list[Figure]:
+    """The same figure is often in a table and the text; keep one, preferring verified."""
     seen, uniq = set(), []
     for f in sorted(figures, key=lambda f: not f.verified):
         key = (f.file, f.metric, f.rate_class.lower(), f.status, round(f.value, 6))
@@ -290,16 +309,18 @@ already provide. Cite the source ids each request relies on."""
 
 
 def draft_irs(client, model: str, chunks: list[Chunk], issues: list[Issue], prefix: str = "DPU",
-              set_no: int = 1, n: int = 10) -> pd.DataFrame:
+              set_no: int = 1, n: int = 10, max_chars: int = 70_000, max_tokens: int = 4000) -> pd.DataFrame:
     flagged = "\n".join(f"- [{i.severity}] {i.description} ({i.file}, {', '.join(i.locations)})"
-                        for i in issues) or "- (no automated findings)"
-    batch = _batches(chunks, 70_000)[0] if chunks else []
+                        for i in issues if i.kind != "unverified") or "- (no automated findings)"
+    batch = _batches(chunks, max_chars)[0] if chunks else []
     out = _call_tool(client, model, IR_SYSTEM,
                      f"Automated review findings:\n{flagged}\n\nFiling excerpts:\n\n{_sources_block(batch)}"
-                     f"\n\nDraft up to {n} information requests, most important first.", IR_TOOL)
+                     f"\n\nDraft up to {n} information requests, most important first.", IR_TOOL, max_tokens)
     rows = []
-    for k, r in enumerate(out.get("requests", [])[:n], start=1):
-        cites = [batch[s - 1].citation() for s in r.get("source_ids", []) if 1 <= s <= len(batch)]
+    reqs = [r for r in out.get("requests", []) or [] if isinstance(r, dict) and r.get("request")]
+    for k, r in enumerate(reqs[:n], start=1):
+        ids = [int(x) for x in (r.get("source_ids") or []) if _to_float(x) is not None]
+        cites = [batch[s - 1].citation() for s in ids if 1 <= s <= len(batch)]
         rows.append({"No.": f"{prefix}-{set_no}-{k}", "Topic": r.get("topic", ""),
                      "Request": r.get("request", ""), "Why": r.get("rationale", ""),
                      "Based on": "; ".join(cites)})
@@ -352,32 +373,58 @@ def ir_groups(chunks: list[Chunk]) -> dict[str, list[Chunk]]:
     return groups
 
 
-def grade_responses(client, model: str, chunks: list[Chunk], uploaded_files: list[str],
-                    drafted: list[str] | None = None) -> pd.DataFrame:
-    groups = ir_groups(chunks)
-    rows = []
-    items = list(groups.items())
-    for i in range(0, len(items), 12):
-        part = items[i:i + 12]
-        body = "\n\n".join(f'<ir id="{ir}">\n' + "\n".join(c.text for c in cs) + "\n</ir>" for ir, cs in part)
-        out = _call_tool(client, model, GRADE_SYSTEM, f"Responses:\n\n{body}", GRADE_TOOL)
-        for g in out.get("grades", []):
-            ir = g.get("ir", "").upper()
-            atts = g.get("attachments", []) or []
-            names = " ".join(uploaded_files).lower()
-            missing = [a for a in atts if a and not any(tok in names for tok in
-                                                        re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)+", a.lower()))]
-            loc = groups.get(ir, [None])[0]
-            rows.append({"IR": ir, "Status": g.get("status", ""), "Summary": g.get("summary", ""),
-                         "Gaps": g.get("gaps", ""), "Attachments not uploaded": ", ".join(missing),
-                         "Suggested follow-up": g.get("follow_up", ""),
-                         "Where": loc.citation() if loc else ""})
+GRADE_COLS = ["IR", "Status", "Summary", "Gaps", "Attachments not uploaded", "Suggested follow-up", "Where"]
+
+
+def missing_attachments(atts: list[str], uploaded_files: list[str]) -> list[str]:
+    """Attachments named in a response whose identifier (e.g. DPU-1-2) is in no uploaded file name."""
+    names = " ".join(uploaded_files).lower()
+    return [a for a in atts if a and not any(tok in names for tok in
+                                             re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)+", a.lower()))]
+
+
+def ir_batches(groups: dict[str, list[Chunk]], max_chars: int, max_items: int = 12) -> list[list]:
+    out, cur, n = [], [], 0
+    for ir, cs in groups.items():
+        size = sum(len(c.text) for c in cs)
+        if cur and (n + size > max_chars or len(cur) >= max_items):
+            out.append(cur)
+            cur, n = [], 0
+        cur.append((ir, cs))
+        n += size
+    if cur:
+        out.append(cur)
+    return out
+
+
+def add_unanswered(rows: list[dict], groups, drafted) -> pd.DataFrame:
     for ir in drafted or []:
         if ir.upper() not in groups:
             rows.append({"IR": ir.upper(), "Status": "no response found", "Summary": "", "Gaps": "",
                          "Attachments not uploaded": "", "Suggested follow-up": "", "Where": ""})
-    cols = ["IR", "Status", "Summary", "Gaps", "Attachments not uploaded", "Suggested follow-up", "Where"]
-    return pd.DataFrame(rows, columns=cols)
+    return pd.DataFrame(rows, columns=GRADE_COLS)
+
+
+def grade_responses(client, model: str, chunks: list[Chunk], uploaded_files: list[str],
+                    drafted: list[str] | None = None, max_chars: int = 60_000,
+                    max_tokens: int = 4000) -> pd.DataFrame:
+    groups = ir_groups(chunks)
+    rows = []
+    for part in ir_batches(groups, max_chars):
+        body = "\n\n".join(f'<ir id="{ir}">\n' + "\n".join(c.text for c in cs) + "\n</ir>" for ir, cs in part)
+        out = _call_tool(client, model, GRADE_SYSTEM, f"Responses:\n\n{body}", GRADE_TOOL, max_tokens)
+        for g in out.get("grades", []) or []:
+            if not isinstance(g, dict):
+                continue
+            ir = str(g.get("ir", "")).upper()
+            atts = [str(a) for a in (g.get("attachments") or [])]
+            loc = groups.get(ir, [None])[0]
+            rows.append({"IR": ir, "Status": g.get("status", ""), "Summary": g.get("summary", ""),
+                         "Gaps": g.get("gaps", ""),
+                         "Attachments not uploaded": ", ".join(missing_attachments(atts, uploaded_files)),
+                         "Suggested follow-up": g.get("follow_up", ""),
+                         "Where": loc.citation() if loc else ""})
+    return add_unanswered(rows, groups, drafted)
 
 
 # --------------------------------------------------------------------------

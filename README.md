@@ -4,7 +4,18 @@ Drag in public utility filings submitted to the Massachusetts Department of Publ
 
 **Live app:** [Open the app](https://dpu-filing-assistant-6tsrcudhmux8mpakqcnlux.streamlit.app/) [![Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://dpu-filing-assistant-6tsrcudhmux8mpakqcnlux.streamlit.app/) · **Author:** Cathy Kam
 
-> **Public filings only.** Files are processed in memory for the browser session and are not stored. Questions and the matching excerpts are sent to the Anthropic API to generate answers. Do not upload confidential or redacted material.
+> **Public filings only.** Files are processed in memory for the browser session and are not stored. With a model selected, questions and matching excerpts are sent to that provider (Groq, Google or Anthropic). In no-AI mode nothing leaves the app. Do not upload confidential or redacted material.
+
+## Models: free by default, no key required
+
+| Option | Cost | Notes |
+|---|---|---|
+| **Groq · GPT-OSS 120B / Llama 3.3 70B** | Free tier | Open models. The free tier's per-minute token limit means the app sends smaller excerpts |
+| **Gemini Flash** | Free tier | On the free tier, Google may use inputs to improve its models |
+| **Claude Sonnet / Haiku / Opus 5.5** | Paid API | Strongest on drafting and extraction |
+| **No AI** | Free, no key | Search with highlighted passages, figures from tables and standard wording, the same arithmetic checks, template IRs, response checks, comparison, retrieval scoring |
+
+The app picks the first provider with a key in Secrets (Groq, then Claude, then Gemini). If none has a key, it uses no-AI mode. Visitors can also paste their own key in the sidebar. Groq and Gemini are reached through their OpenAI-compatible endpoints. `rag/llm.py` translates the same calls, including forced tool use for structured output, so every feature works with every provider.
 
 ## What it does
 
@@ -14,7 +25,7 @@ Drag in public utility filings submitted to the Massachusetts Department of Publ
   - PDF tables are extracted row by row, so a rate or dollar figure stays next to its label.
   - Excel schedules keep their column headers, and citations give the real sheet and row numbers.
   - Docket numbers (e.g. D.P.U. 25-PGAF-GRID) and document type (GAF filing, rate case, IR response) are detected automatically.
-- **Cited answers:** Claude answers only from the retrieved excerpts, quotes figures exactly as filed, flags conflicts between an original and a revision, and says so when the filings don't contain the answer. Click "Sources cited" to read each excerpt.
+- **Cited answers:** the model answers only from the retrieved excerpts, quotes figures exactly as filed, flags conflicts between an original and a revision, and says so when the filings don't contain the answer. Click "Sources cited" to read each excerpt.
 - **Scope and export:** limit questions to selected files, and download the Q&A with citations.
 - **Try it without your own files:** one click loads three fictional sample filings.
 
@@ -22,9 +33,9 @@ Drag in public utility filings submitted to the Massachusetts Department of Publ
 
 | Tab | What it does | What is AI and what isn't |
 |---|---|---|
-| **Key figures & checks** | Every GAF, LDAF, cost-of-gas component, reconciliation balance, sales forecast and bill impact in a table, with the sentence it came from | Claude extracts via a JSON schema (tool use). Code then confirms each quote and number appear verbatim on the cited page (✓/✗), checks that components sum to the total (0.5% tolerance), flags proposed-vs-prior changes over 10% and missing items |
-| **Draft IRs** | Numbered requests (e.g. DPU-1-1…) in DPU style, each with a rationale and the page that prompted it; edit in the table, download as Word, text or CSV | Claude drafts, starting from the automatic findings |
-| **Track responses** | For each IR response: answered / partial / non-responsive / objection / refers to attachment, gaps, attachments not yet uploaded, suggested follow-up; drafted IRs with no response are flagged | Claude grades; the attachment and no-response checks are code |
+| **Key figures & checks** | Every GAF, LDAF, cost-of-gas component, reconciliation balance, sales forecast and bill impact in a table, with the sentence it came from | The model extracts via a JSON schema (tool use); in no-AI mode, table rows and keyword patterns do. Code then confirms each quote and number appear verbatim on the cited page (✓/✗), checks that components sum to the total (0.5% tolerance), flags proposed-vs-prior changes over 10% and missing items |
+| **Draft IRs** | Numbered requests (e.g. DPU-1-1…) in DPU style, each with a rationale and the page that prompted it; edit in the table, download as Word, text or CSV | The model drafts, starting from the automatic findings; in no-AI mode, templates are filled from the checks and figures |
+| **Track responses** | For each IR response: answered / partial / non-responsive / objection / refers to attachment, gaps, attachments not yet uploaded, suggested follow-up; drafted IRs with no response are flagged | The model grades; in no-AI mode, rules flag objections, deferrals and short answers. Attachment and no-response checks are always code |
 | **Compare filings** | Last year's vs this year's filing, figure by figure, with change and the page for each number | Join and arithmetic are code |
 
 Draft IRs are a starting point for staff review. This demo is intended for public filings.
@@ -36,6 +47,7 @@ Draft IRs are a starting point for staff review. This demo is intended for publi
 ```bash
 python eval/run_eval.py                                  # retrieval only, free
 python eval/run_eval.py --answers --baseline             # needs ANTHROPIC_API_KEY in your shell
+python eval/run_eval.py --answers --model "Groq · GPT-OSS 120B (free)"   # needs GROQ_API_KEY: compare an open model with Claude
 python eval/run_eval.py --questions eval/questions_real.csv --files filings --answers --baseline
 ```
 
@@ -62,12 +74,14 @@ question → keyword search (BM25) tuned for docket/IR numbers, rate classes and
 |---|---|
 | `rag/ingest.py` | Readers for PDF (pdfplumber), Excel, Word, CSV; IR splitting; docket and document-type detection |
 | `rag/search.py` | BM25 search with a filing-aware tokenizer; IR-number boosting; whole-document mode for small uploads |
-| `rag/answer.py` | Prompt, streaming call to the Claude API, citation parsing |
+| `rag/llm.py` | Providers (Groq, Gemini, Anthropic), size budgets, OpenAI-compatible adapter, error messages |
+| `rag/answer.py` | Prompt, streaming answer, citation parsing |
+| `rag/rules.py` | No-AI mode: pattern-based figures, template IRs, response checks, passage highlighting |
 | `rag/discovery.py` | Figure extraction (tool use + verbatim verification), checks, IR drafting, response grading, comparison |
 | `rag/evaluate.py`, `eval/` | Question sets, scoring, baseline, reports |
 | `app.py` | Streamlit interface: upload, Ask, Key figures, Draft IRs, Track responses, Compare, Evaluation |
 | `samples/` | Fictional sample filings (`make_samples.py` regenerates them) |
-| `tests/` | 17 tests on ingestion, search, prompts, discovery and scoring (the API is faked, so tests are free) |
+| `tests/` | 29 tests on ingestion, search, prompts, discovery, scoring, the Groq/Gemini adapter and no-AI mode (the API is faked, so tests are free) |
 
 Scanned PDFs without a text layer are flagged; run OCR first for those pages to be searchable.
 
@@ -84,8 +98,8 @@ streamlit run app.py
 
 1. Push this repo to GitHub.
 2. On share.streamlit.io, create an app from the repo with main file `app.py`.
-3. In **App settings → Secrets**, add `ANTHROPIC_API_KEY`, and optionally `APP_PASSWORD` and `MAX_QUESTIONS` (see `.streamlit/secrets.toml.example`). `MAX_QUESTIONS` caps AI requests per session on your key. Visitors who paste their own key are not capped.
-4. In the Anthropic Console, set a monthly spend limit for the key.
+3. In **App settings → Secrets**, add any of `GROQ_API_KEY` (free, console.groq.com/keys), `GEMINI_API_KEY` or `ANTHROPIC_API_KEY`. You can also add none, and the app runs in no-AI mode. Optional: `DEFAULT_MODEL`, `APP_PASSWORD`, `MAX_QUESTIONS` (see `.streamlit/secrets.toml.example`). `MAX_QUESTIONS` caps AI requests per session on your keys. Visitors who paste their own key are not capped.
+4. For a paid key (Anthropic), set a monthly spend limit in the provider's console.
 
 ## Limitations and next steps
 

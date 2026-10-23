@@ -1,4 +1,4 @@
-"""Ask Claude a question about the retrieved filing excerpts, with citations."""
+"""Ask the model a question about the retrieved filing excerpts, with citations."""
 from __future__ import annotations
 
 import re
@@ -6,12 +6,7 @@ from typing import Iterator
 
 from .ingest import Chunk
 
-MODELS = {
-    "Claude Sonnet 5.5 (balanced)": "claude-sonnet-5-5",
-    "Claude Haiku 5.5 (fastest, cheapest)": "claude-haiku-5-5",
-    "Claude Opus 5.5 (most capable)": "claude-opus-5-5",
-}
-DEFAULT_MODEL = "Claude Sonnet 5.5 (balanced)"
+# model choices live in rag/llm.py; any client with an Anthropic-style interface works here
 
 SYSTEM = """You are a research assistant for staff reviewing public utility filings submitted to the \
 Massachusetts Department of Public Utilities (DPU): gas adjustment factor (GAF/PGAF/OGAF) filings, \

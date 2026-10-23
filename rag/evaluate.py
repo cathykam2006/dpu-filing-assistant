@@ -145,15 +145,18 @@ def score_answer(q: Question, text: str) -> tuple[bool, list[str]]:
 # --------------------------------------------------------------------------
 # running
 # --------------------------------------------------------------------------
-def complete(client, model: str, system: str, user: str, max_tokens: int = 1200) -> str:
+def complete(client, model: str, system: str, user: str, max_tokens: int = 1500) -> str:
     resp = client.messages.create(model=model, max_tokens=max_tokens, system=system,
                                   messages=[{"role": "user", "content": user}])
     return "".join(getattr(b, "text", "") for b in resp.content)
 
 
 def run(questions: list[Question], chunks: list[Chunk], client=None, model: str = "claude-sonnet-5-5",
-        k: int = 8, baseline: bool = False, force_ranking: bool = True, progress=None) -> list[Result]:
-    """Run every question. Without a client only retrieval is scored (free)."""
+        k: int = 8, baseline: bool = False, force_ranking: bool = True, progress=None,
+        max_chars: int | None = None, max_tokens: int = 1500,
+        baseline_chars: int = BASELINE_CHARS) -> list[Result]:
+    """Run every question. Without a client only retrieval is scored (free).
+    max_chars / baseline_chars cap what is sent, for models with small token budgets."""
     index = search.Index(chunks)
     saved = search.WHOLE_CORPUS_CHARS
     results = []
@@ -176,8 +179,8 @@ def run(questions: list[Question], chunks: list[Chunk], client=None, model: str 
                 r.values_retrieved = all(value_found(v, text) for v in q.expected_values)
 
             if client is not None:
-                live_hits = index.search(q.question, k=k, files=files)   # what the app would send
-                gen, sources = answer.stream_answer(client, model, q.question, live_hits, [])
+                live_hits = index.search(q.question, k=k, files=files, max_chars=max_chars)  # as in the app
+                gen, sources = answer.stream_answer(client, model, q.question, live_hits, [], max_tokens)
                 r.answer = "".join(gen)
                 r.figures_correct, r.missing_values = score_answer(q, r.answer)
                 cited = [sources[i - 1] for i in answer.cited_ids(r.answer) if 0 < i <= len(sources)]
@@ -190,9 +193,9 @@ def run(questions: list[Question], chunks: list[Chunk], client=None, model: str 
                         and any(value_found(v, c.text) for v in q.expected_values) for c in cited)
                 if baseline:
                     pool = [c for c in chunks if not files or c.file in files]
-                    docs = "\n\n".join(f"--- {c.citation()} ---\n{c.text}" for c in pool)[:BASELINE_CHARS]
+                    docs = "\n\n".join(f"--- {c.citation()} ---\n{c.text}" for c in pool)[:baseline_chars]
                     r.baseline_answer = complete(client, model, BASELINE_SYSTEM,
-                                                 f"Documents:\n\n{docs}\n\nQuestion: {q.question}")
+                                                 f"Documents:\n\n{docs}\n\nQuestion: {q.question}", max_tokens)
                     r.baseline_correct, _ = score_answer(q, r.baseline_answer)
             results.append(r)
     finally:
