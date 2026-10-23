@@ -259,9 +259,9 @@ def docx_bytes(title: str, df: pd.DataFrame) -> bytes:
     import docx
     doc = docx.Document()
     doc.add_heading(title, 1)
-    for _, r in df.iterrows():
+    for _, r in discovery.clean_irs(df).iterrows():
         doc.add_heading(f"Information Request {r['No.']}", 3)
-        doc.add_paragraph(str(r["Request"]))
+        doc.add_paragraph(r["Request"])
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
@@ -481,6 +481,7 @@ with tabs[2]:
             edited = st.data_editor(ss.irs, hide_index=True, width="stretch", num_rows="dynamic",
                                     key="ir_editor",
                                     column_config={"Request": st.column_config.TextColumn(width="large")})
+            edited = discovery.clean_irs(edited, prefix, int(set_no))     # blank or added rows
             title = f"Information Requests — Set {int(set_no)}"
             d1, d2, d3 = st.columns(3)
             d1.download_button("Word (.docx)", docx_bytes(title, edited), file_name="information_requests.docx")

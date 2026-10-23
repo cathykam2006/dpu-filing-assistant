@@ -331,9 +331,27 @@ def draft_irs(client, model: str, chunks: list[Chunk], issues: list[Issue], pref
     return pd.DataFrame(rows, columns=["No.", "Topic", "Request", "Why", "Based on"])
 
 
+def clean_irs(df: pd.DataFrame, prefix: str = "DPU", set_no: int = 1) -> pd.DataFrame:
+    """Tidy the edited IR table: empty cells become "", rows without a request are dropped,
+    and rows added without a number get the next one in the set."""
+    cols = ["No.", "Topic", "Request", "Why", "Based on"]
+    df = df.reindex(columns=cols).astype(object).where(df.reindex(columns=cols).notna(), "")
+    df = df.map(lambda v: str(v).strip())
+    df = df[df["Request"] != ""].reset_index(drop=True)
+    used = {n for n in df["No."] if n}
+    k = 1
+    for i in df.index:
+        if not df.at[i, "No."]:
+            while f"{prefix}-{set_no}-{k}" in used:
+                k += 1
+            df.at[i, "No."] = f"{prefix}-{set_no}-{k}"
+            used.add(df.at[i, "No."])
+    return df
+
+
 def irs_to_text(df: pd.DataFrame, header: str = "") -> str:
     lines = [header] if header else []
-    for _, r in df.iterrows():
+    for _, r in clean_irs(df).iterrows():
         lines += [f"Information Request {r['No.']}", r["Request"], ""]
     return "\n".join(lines)
 

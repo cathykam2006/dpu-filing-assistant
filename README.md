@@ -96,7 +96,7 @@ question → keyword search (BM25) tuned for docket/IR numbers, rate classes and
 | `rag/evaluate.py`, `eval/` | Question sets, scoring, baseline, reports |
 | `app.py` | Streamlit interface: upload, Ask, Key figures, Draft IRs, Track responses, Compare, Evaluation |
 | `samples/` | Fictional sample filings (`make_samples.py` regenerates them) |
-| `tests/` | 44 tests on ingestion, search, prompts, discovery, scoring, the Groq/Gemini adapter, no-AI mode and verification (the API is faked, so tests are free) |
+| `tests/` | 45 tests on ingestion, search, prompts, discovery, scoring, the Groq/Gemini adapter, no-AI mode and verification (the API is faked, so tests are free) |
 
 Scanned PDFs without a text layer are flagged; run OCR first for those pages to be searchable.
 

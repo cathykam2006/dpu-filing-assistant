@@ -199,3 +199,16 @@ def test_wrong_source_id_is_relocated():
                               quote="LNG peaking | 4,817,420", source_id=1)]}
     f = D.extract_figures(FakeTools({"record_figures": wrong}), "m", chunks)[0]
     assert f.verified and f.location == "p. 2 (table)"
+
+
+def test_edited_ir_table_with_blank_and_added_rows():
+    import pandas as pd
+    df = pd.DataFrame([
+        {"No.": "DPU-1-1", "Topic": "LNG", "Request": "Explain LNG costs.", "Why": None, "Based on": float("nan")},
+        {"No.": None, "Topic": None, "Request": None, "Why": None, "Based on": None},          # empty new row
+        {"No.": None, "Topic": "Added", "Request": "Provide workpapers.", "Why": "", "Based on": None},
+    ])
+    clean = D.clean_irs(df, "DPU", 1)
+    assert list(clean["No."]) == ["DPU-1-1", "DPU-1-2"] and clean["Why"].iloc[0] == ""
+    text = D.irs_to_text(df, "Set 1")
+    assert "Information Request DPU-1-2\nProvide workpapers." in text and "None" not in text
