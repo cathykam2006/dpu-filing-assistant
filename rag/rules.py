@@ -21,6 +21,7 @@ import pandas as pd
 from .discovery import (GRADE_COLS, Figure, Issue, METRICS, add_unanswered, dedupe, ir_groups,
                         missing_attachments, verify)
 from .ingest import Chunk
+from .schedules import parse as parse_schedule
 
 # keyword -> metric, checked in order (first match wins)
 LABEL_METRICS = [
@@ -172,8 +173,8 @@ def _from_prose(c: Chunk) -> list[Figure]:
 def extract_figures(chunks: list[Chunk]) -> list[Figure]:
     tables, prose = [], []
     for c in chunks:
-        if c.kind == "spreadsheet":
-            continue                                     # monthly schedules are detail, not headline figures
+        if c.kind == "spreadsheet" or parse_schedule(c.text):
+            continue          # monthly detail, and numbered-line schedules (read by verify.schedule_figures)
         if c.kind == "table":
             tables += _from_table(c)
         else:

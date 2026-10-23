@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from .schedules import header_line
+
 MAX_CHARS = 1800        # target chunk size
 OVERLAP = 250           # characters carried into the next chunk
 ROWS_PER_CHUNK = 40     # Excel/CSV rows per chunk
@@ -61,6 +63,7 @@ class Document:
     chunks: list[Chunk]
     dockets: list[str]
     warning: str | None = None
+    page_texts: list[tuple[str, str]] = field(default_factory=list)   # (location, full page text)
 
 
 # --------------------------------------------------------------------------
@@ -80,19 +83,33 @@ def _split(text: str, max_chars: int = MAX_CHARS, overlap: int = OVERLAP) -> lis
     paras = re.split(r"\n\s*\n", text)
     out, cur = [], ""
     for p in paras:
-        if len(p) > max_chars:      # very long paragraph: split on sentences
+        tabular = p.count("\n") >= 5 and len(p) / (p.count("\n") + 1) < 400
+        if len(p) > max_chars and tabular:     # schedules: keep each row whole
+            parts = p.split("\n")
+        elif len(p) > max_chars:               # long prose: split on sentences
             parts = re.split(r"(?<=[.;:])\s+", p)
         else:
             parts = [p]
+        sep = "\n" if len(parts) > 1 and tabular else "\n\n"
         for part in parts:
             if len(cur) + len(part) + 2 > max_chars and cur:
                 out.append(cur.strip())
-                cur = cur[-overlap:] + "\n" + part
+                if tabular:                    # carry the last whole rows, never half a row
+                    tail = cur.split("\n")[-2:]
+                    cur = "\n".join(tail)[-overlap:].split("\n", 1)[-1] + "\n" + part
+                else:
+                    cur = cur[-overlap:] + "\n" + part
             else:
-                cur = f"{cur}\n\n{part}" if cur else part
+                cur = f"{cur}{sep}{part}" if cur else part
     if cur.strip():
         out.append(cur.strip())
     return out
+
+
+def with_header(pieces: list[str], text: str) -> list[str]:
+    """Repeat a schedule's column header (rate classes) at the top of every piece of the page."""
+    head = header_line(text)
+    return [p if not head or head in p else f"{head}\n{p}" for p in pieces]
 
 
 def classify(text: str, name: str) -> str:
@@ -130,7 +147,7 @@ def split_by_ir(text: str) -> list[tuple[str | None, str]]:
 def read_pdf(name: str, data: bytes) -> Document:
     import pdfplumber
 
-    chunks, all_text, pages, empty = [], [], 0, 0
+    chunks, all_text, pages, empty, page_texts = [], [], 0, 0, []
     current_ir = None
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         pages = len(pdf.pages)
@@ -143,9 +160,10 @@ def read_pdf(name: str, data: bytes) -> Document:
             if not text:
                 empty += 1
             all_text.append(text)
+            page_texts.append((f"p. {i}", text))
             for ir, part in split_by_ir(text) if text else []:
                 current_ir = ir or current_ir
-                for piece in _split(part):
+                for piece in with_header(_split(part), text):   # every piece of a schedule keeps its columns
                     chunks.append(Chunk(piece, name, f"p. {i}", page=i, ir=current_ir))
             try:
                 for t in page.extract_tables() or []:
@@ -162,7 +180,7 @@ def read_pdf(name: str, data: bytes) -> Document:
     if pages and empty / pages > 0.5:
         warning = (f"{empty} of {pages} pages have no extractable text (likely scanned images). "
                    "Run OCR first (e.g. Adobe 'Recognize Text') for those pages to be searchable.")
-    return Document(name, classify(joined, name), pages, chunks, find_dockets(joined), warning)
+    return Document(name, classify(joined, name), pages, chunks, find_dockets(joined), warning, page_texts)
 
 
 def _frame_chunks(df: pd.DataFrame, name: str, where: str, first_row: int = 2) -> list[Chunk]:
@@ -235,8 +253,8 @@ def read_docx(name: str, data: bytes) -> Document:
 def read_text(name: str, data: bytes) -> Document:
     text = _clean(data.decode("utf-8", errors="ignore"))
     chunks = [Chunk(p, name, f"part {i}", ir=ir)
-              for i, (ir, part) in enumerate(split_by_ir(text), start=1) for p in _split(part)]
-    return Document(name, classify(text, name), 1, chunks, find_dockets(text))
+              for i, (ir, part) in enumerate(split_by_ir(text), start=1) for p in with_header(_split(part), text)]
+    return Document(name, classify(text, name), 1, chunks, find_dockets(text), page_texts=[("text", text)])
 
 
 READERS = {".pdf": read_pdf, ".xlsx": read_excel, ".xlsm": read_excel, ".xls": read_excel,

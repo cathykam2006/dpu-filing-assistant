@@ -73,6 +73,7 @@ class Result:
     answer: str = ""
     figures_correct: bool | None = None
     citation_correct: bool | None = None
+    numbers_traced: bool | None = None
     baseline_answer: str = ""
     baseline_correct: bool | None = None
     missing_values: list[str] = field(default_factory=list)
@@ -154,7 +155,7 @@ def complete(client, model: str, system: str, user: str, max_tokens: int = 1500)
 def run(questions: list[Question], chunks: list[Chunk], client=None, model: str = "claude-sonnet-5-5",
         k: int = 8, baseline: bool = False, force_ranking: bool = True, progress=None,
         max_chars: int | None = None, max_tokens: int = 1500,
-        baseline_chars: int = BASELINE_CHARS) -> list[Result]:
+        baseline_chars: int = BASELINE_CHARS, measure=len) -> list[Result]:
     """Run every question. Without a client only retrieval is scored (free).
     max_chars / baseline_chars cap what is sent, for models with small token budgets."""
     index = search.Index(chunks)
@@ -179,10 +180,14 @@ def run(questions: list[Question], chunks: list[Chunk], client=None, model: str 
                 r.values_retrieved = all(value_found(v, text) for v in q.expected_values)
 
             if client is not None:
-                live_hits = index.search(q.question, k=k, files=files, max_chars=max_chars)  # as in the app
+                live_hits = index.search(q.question, k=k, files=files, max_chars=max_chars,
+                                         measure=measure)                     # as in the app
                 gen, sources = answer.stream_answer(client, model, q.question, live_hits, [], max_tokens)
                 r.answer = "".join(gen)
                 r.figures_correct, r.missing_values = score_answer(q, r.answer)
+                from .verify import answer_ok, check_answer
+                nums = check_answer(r.answer, sources)
+                r.numbers_traced = answer_ok(nums) if nums else None
                 cited = [sources[i - 1] for i in answer.cited_ids(r.answer) if 0 < i <= len(sources)]
                 r.cited = "; ".join(c.citation() for c in cited)
                 if q.abstain:
@@ -193,7 +198,14 @@ def run(questions: list[Question], chunks: list[Chunk], client=None, model: str 
                         and any(value_found(v, c.text) for v in q.expected_values) for c in cited)
                 if baseline:
                     pool = [c for c in chunks if not files or c.file in files]
-                    docs = "\n\n".join(f"--- {c.citation()} ---\n{c.text}" for c in pool)[:baseline_chars]
+                    parts, used = [], 0
+                    for c in pool:                       # whole documents, in order, up to the budget
+                        part = f"--- {c.citation()} ---\n{c.text}"
+                        if parts and used + measure(part) > baseline_chars:
+                            break
+                        parts.append(part)
+                        used += measure(part)
+                    docs = "\n\n".join(parts)
                     r.baseline_answer = complete(client, model, BASELINE_SYSTEM,
                                                  f"Documents:\n\n{docs}\n\nQuestion: {q.question}", max_tokens)
                     r.baseline_correct, _ = score_answer(q, r.baseline_answer)
@@ -212,6 +224,7 @@ def results_frame(results: list[Result]) -> pd.DataFrame:
         rows.append({"ID": r.id, "Category": r.category, "Question": r.question, "Expected": r.expected,
                      "Retrieval hit": r.retrieval_hit, "Values retrieved": r.values_retrieved,
                      "Figures correct": r.figures_correct, "Citation correct": r.citation_correct,
+                     "Numbers traced": r.numbers_traced,
                      "Baseline correct": r.baseline_correct,
                      "Missing values": "; ".join(r.missing_values), "Cited": r.cited,
                      "Answer": r.answer, "Baseline answer": r.baseline_answer})
@@ -228,6 +241,7 @@ def summary(df: pd.DataFrame) -> pd.DataFrame:
               "Values retrieved": "All expected figures in retrieved text",
               "Figures correct": "Answer correct (assistant)",
               "Citation correct": "Citation points to the right place",
+              "Numbers traced": "Every number in the answer found in its cited source",
               "Baseline correct": "Answer correct (whole-document baseline)"}
     rows = []
     for col, label in labels.items():

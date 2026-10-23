@@ -47,16 +47,19 @@ class Index:
         self.total_chars = sum(len(c.text) for c in chunks)
 
     def search(self, query: str, k: int = 12, files: list[str] | None = None,
-               max_chars: int | None = None, always_rank: bool = False) -> list[tuple[Chunk, float]]:
-        """max_chars caps the total excerpt size (for models with small token budgets).
+               max_chars: int | None = None, always_rank: bool = False,
+               measure=len) -> list[tuple[Chunk, float]]:
+        """max_chars caps the total excerpt size, in units of `measure` (characters by default;
+        pass llm.estimate_tokens to budget in tokens for models with small limits).
         always_rank returns only the best matches even when everything would fit."""
         if not self.chunks:
             return []
         pool = [i for i, c in enumerate(self.chunks) if not files or c.file in files]
         if not pool:
             return []
-        whole = WHOLE_CORPUS_CHARS if max_chars is None else min(WHOLE_CORPUS_CHARS, max_chars)
-        if not always_rank and sum(len(self.chunks[i].text) for i in pool) <= whole:
+        fits = sum(len(self.chunks[i].text) for i in pool) <= WHOLE_CORPUS_CHARS and (
+            max_chars is None or sum(measure(self.chunks[i].text) for i in pool) <= max_chars)
+        if not always_rank and fits:
             return [(self.chunks[i], 1.0) for i in pool]
 
         scores = self.bm25.get_scores(tokenize(query))
@@ -71,10 +74,11 @@ class Index:
         if max_chars is not None:
             kept, used = [], 0
             for i in picked:               # picked is in priority order: named IRs, then best score
-                if kept and used + len(self.chunks[i].text) > max_chars:
+                size = measure(self.chunks[i].text)
+                if kept and used + size > max_chars:
                     continue
                 kept.append(i)
-                used += len(self.chunks[i].text)
+                used += size
             picked = kept
         # keep reading order within each file so tables and their headings stay together
         picked.sort(key=lambda i: (self.chunks[i].file, i))

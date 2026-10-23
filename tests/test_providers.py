@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace as NS
 
+import pytest
+
 
 from rag import discovery as D
 from rag import ingest, llm, rules, search
@@ -145,3 +147,67 @@ def test_rules_response_checks():
 
 def test_highlight():
     assert "**LNG**" in rules.highlight("LNG peaking supply", "What is the LNG cost?")
+
+
+# ------------------------------------------------------------------ Groq's 8,000 tokens-per-minute limit
+class Capture(FakeCompletions):
+    def __init__(self):
+        super().__init__(tool_args={"figures": [], "requests": [], "grades": []})
+
+    def size(self, i=-1):
+        kw = self.calls[i]
+        return llm._messages_tokens(kw["messages"]) + kw["max_tokens"] + sum(
+            llm.estimate_tokens(json.dumps(t)) for t in kw.get("tools") or [])
+
+
+def every_file():
+    names = ["sample_pgaf_filing.pdf", "sample_ir_responses.pdf", "sample_schedule3.xlsx",
+             "real_NSTAR_Gas_LDAC_DPU_26-PGAF-NSTAR_corrected.pdf"]
+    return [c for n in names for c in load(n).chunks]
+
+
+def test_estimate_is_conservative_for_numbers():
+    row = "19 LDAF = Total Local Distribution Adjustment Factor $0.7434 $0.5718 $0.7434 $0.5718 $0.5085"
+    assert llm.estimate_tokens(row) >= len(row) / 2.5          # number-heavy text: ~2 chars per token
+    assert llm.estimate_tokens("The Company proposes a new factor.") <= 12
+
+
+def test_groq_question_with_everything_loaded_fits_the_limit():
+    from rag import answer
+    G = llm.PROVIDERS["groq"]
+    chunks = every_file()
+    hits = search.Index(chunks).search("What is the LDAF for R-3 and the LNG cost?", max_chars=G.context_tokens,
+                                       measure=llm.estimate_tokens)
+    history = [{"role": r, "content": "A long earlier answer with $0.7434 and $4,817,420 figures. " * 60}
+               for r in ("user", "assistant") * 5]
+    fake = Capture()
+    gen, _ = answer.stream_answer(compat("groq", fake), "openai/gpt-oss-120b", "LDAF?", hits, history,
+                                  G.max_tokens, G.history_turns)
+    "".join(gen)
+    assert fake.size() <= G.request_tokens < 8000
+
+
+def test_groq_extraction_drafting_and_grading_fit_the_limit():
+    G = llm.PROVIDERS["groq"]
+    chunks = every_file()
+    fake = Capture()
+    client = compat("groq", fake)
+    D.extract_figures(client, "m", chunks, max_chars=G.batch_tokens, max_tokens=G.max_tokens,
+                      measure=llm.estimate_tokens)
+    issues = [D.Issue("missing", "low", "No typical customer bill impact found. " * 5, "x.pdf")] * 6
+    D.draft_irs(client, "m", chunks, issues, max_chars=G.batch_tokens, max_tokens=G.max_tokens,
+                measure=llm.estimate_tokens)
+    D.grade_responses(client, "m", chunks, [], max_chars=G.batch_tokens, max_tokens=G.max_tokens,
+                      measure=llm.estimate_tokens)
+    assert len(fake.calls) >= 4
+    assert max(fake.size(i) for i in range(len(fake.calls))) <= G.request_tokens
+
+
+def test_oversized_request_is_stopped_before_sending():
+    fake = Capture()
+    with pytest.raises(llm.TooLarge):
+        compat("groq", fake).create(model="m", max_tokens=1200, system="s",
+                                    messages=[{"role": "user", "content": "$0.7434 " * 3000}])
+    assert fake.calls == []                                     # nothing was sent
+    msg = llm.describe_error(llm.TooLarge("x"), "groq")
+    assert "too large" in msg and "Search within" in msg

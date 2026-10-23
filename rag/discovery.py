@@ -109,14 +109,16 @@ def _sources_block(chunks: list[Chunk], start: int = 1) -> str:
         for i, c in enumerate(chunks))
 
 
-def _batches(chunks: list[Chunk], max_chars: int = 60_000) -> list[list[Chunk]]:
+def _batches(chunks: list[Chunk], max_chars: int = 60_000, measure=len) -> list[list[Chunk]]:
+    """Group chunks so each group stays under max_chars, in units of `measure`."""
     out, cur, n = [], [], 0
     for c in chunks:
-        if cur and n + len(c.text) > max_chars:
+        size = measure(c.text)
+        if cur and n + size > max_chars:
             out.append(cur)
             cur, n = [], 0
         cur.append(c)
-        n += len(c.text)
+        n += size
     if cur:
         out.append(cur)
     return out
@@ -183,10 +185,10 @@ def _to_float(v) -> float | None:
 
 
 def extract_figures(client, model: str, chunks: list[Chunk], max_chars: int = 60_000,
-                    max_tokens: int = 4000) -> list[Figure]:
+                    max_tokens: int = 4000, measure=len) -> list[Figure]:
     numeric = [c for c in chunks if has_numbers(c)]
     figures: list[Figure] = []
-    for batch in _batches(numeric, max_chars):
+    for batch in _batches(numeric, max_chars, measure):
         out = _call_tool(client, model, EXTRACT_SYSTEM,
                          f"Filing excerpts:\n\n{_sources_block(batch)}", FIGURE_TOOL, max_tokens)
         for f in out.get("figures", []) or []:
@@ -217,7 +219,8 @@ def dedupe(figures: list[Figure]) -> list[Figure]:
     """The same figure is often in a table and the text; keep one, preferring verified."""
     seen, uniq = set(), []
     for f in sorted(figures, key=lambda f: not f.verified):
-        key = (f.file, f.metric, f.rate_class.lower(), f.status, round(f.value, 6))
+        key = (f.file, f.metric, f.rate_class.lower(), f.status, round(f.value, 6),
+               f.label.lower() if f.metric == "other" else "")
         if key not in seen:
             seen.add(key)
             uniq.append(f)
@@ -265,7 +268,7 @@ def run_checks(figs: list[Figure]) -> list[Issue]:
                                             f"from {a:.4f} to {b:.4f} ({(b / a - 1) * 100:+.1f}%).", file,
                                             sorted(set(g["location"]))))
         # missing items for a cost-of-gas filing
-        if (d["metric"] == "gaf").any():
+        if (d["metric"] == "gaf").any() and d["metric"].isin(["cost_of_gas_total", "commodity_cost"]).any():
             for metric, why in (("reconciliation", "No prior-period reconciliation balance found."),
                                 ("bill_impact_dollars", "No typical customer bill impact found."),
                                 ("forecast_sales", "No forecast sales volume found.")):
@@ -309,10 +312,11 @@ already provide. Cite the source ids each request relies on."""
 
 
 def draft_irs(client, model: str, chunks: list[Chunk], issues: list[Issue], prefix: str = "DPU",
-              set_no: int = 1, n: int = 10, max_chars: int = 70_000, max_tokens: int = 4000) -> pd.DataFrame:
+              set_no: int = 1, n: int = 10, max_chars: int = 70_000, max_tokens: int = 4000,
+              measure=len) -> pd.DataFrame:
     flagged = "\n".join(f"- [{i.severity}] {i.description} ({i.file}, {', '.join(i.locations)})"
                         for i in issues if i.kind != "unverified") or "- (no automated findings)"
-    batch = _batches(chunks, max_chars)[0] if chunks else []
+    batch = _batches(chunks, max(1, max_chars - measure(flagged)), measure)[0] if chunks else []
     out = _call_tool(client, model, IR_SYSTEM,
                      f"Automated review findings:\n{flagged}\n\nFiling excerpts:\n\n{_sources_block(batch)}"
                      f"\n\nDraft up to {n} information requests, most important first.", IR_TOOL, max_tokens)
@@ -383,10 +387,10 @@ def missing_attachments(atts: list[str], uploaded_files: list[str]) -> list[str]
                                              re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)+", a.lower()))]
 
 
-def ir_batches(groups: dict[str, list[Chunk]], max_chars: int, max_items: int = 12) -> list[list]:
+def ir_batches(groups: dict[str, list[Chunk]], max_chars: int, max_items: int = 12, measure=len) -> list[list]:
     out, cur, n = [], [], 0
     for ir, cs in groups.items():
-        size = sum(len(c.text) for c in cs)
+        size = sum(measure(c.text) for c in cs)
         if cur and (n + size > max_chars or len(cur) >= max_items):
             out.append(cur)
             cur, n = [], 0
@@ -407,10 +411,10 @@ def add_unanswered(rows: list[dict], groups, drafted) -> pd.DataFrame:
 
 def grade_responses(client, model: str, chunks: list[Chunk], uploaded_files: list[str],
                     drafted: list[str] | None = None, max_chars: int = 60_000,
-                    max_tokens: int = 4000) -> pd.DataFrame:
+                    max_tokens: int = 4000, measure=len) -> pd.DataFrame:
     groups = ir_groups(chunks)
     rows = []
-    for part in ir_batches(groups, max_chars):
+    for part in ir_batches(groups, max_chars, measure=measure):
         body = "\n\n".join(f'<ir id="{ir}">\n' + "\n".join(c.text for c in cs) + "\n</ir>" for ir, cs in part)
         out = _call_tool(client, model, GRADE_SYSTEM, f"Responses:\n\n{body}", GRADE_TOOL, max_tokens)
         for g in out.get("grades", []) or []:

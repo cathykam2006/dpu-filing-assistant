@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from rag import answer, discovery, evaluate, ingest, llm, rules, search
+from rag import answer, discovery, evaluate, ingest, llm, rules, schedules, search, verify
 
 st.set_page_config(page_title="DPU Filing Assistant", page_icon="📑", layout="wide")
 
@@ -47,6 +47,7 @@ ss.setdefault("asked", 0)          # AI requests used this session
 ss.setdefault("unlocked", not secret("APP_PASSWORD"))
 ss.setdefault("upload_key", 0)
 ss.setdefault("use_samples", False)
+ss.setdefault("use_real", False)
 ss.setdefault("figs", {})          # (file hash, model) -> list[Figure]
 ss.setdefault("irs", None)         # DataFrame of drafted IRs
 ss.setdefault("grades", None)      # DataFrame of graded responses
@@ -99,7 +100,7 @@ with st.sidebar:
     if st.button("Clear documents and results", width="stretch"):
         for k in ("docs", "figs"):
             ss[k] = {}
-        ss.chat, ss.use_samples, ss.irs, ss.grades, ss.eval = [], False, None, None, None
+        ss.chat, ss.use_samples, ss.use_real, ss.irs, ss.grades, ss.eval = [], False, False, None, None, None
         ss.upload_key += 1          # resets the drag-and-drop box
         st.rerun()
     st.divider()
@@ -132,9 +133,11 @@ for f in files or []:
         except Exception as e:
             st.error(f"{f.name}: could not be read ({e}).")
 
-if ss.use_samples:
-    for pth in sorted(SAMPLES.glob("sample_*.*")):
+if ss.use_samples or ss.use_real:
+    for pth in sorted(SAMPLES.glob("*.*")):
         if pth.suffix not in (".pdf", ".xlsx"):
+            continue
+        if not ((ss.use_samples and pth.name.startswith("sample_")) or (ss.use_real and pth.name.startswith("real_"))):
             continue
         data = pth.read_bytes()
         h = hashlib.sha1(data).hexdigest()
@@ -160,8 +163,12 @@ if docs:
             st.warning(f"**{d.name}:** {d.warning}")
 else:
     st.info("Upload one or more filings to start. Supported: PDF, Excel, Word, CSV, text.")
-    if st.button("Or try it with three fictional sample filings"):
+    b1, b2 = st.columns(2)
+    if b1.button("Or try it with three fictional sample filings", width="stretch"):
         ss.use_samples = True
+        st.rerun()
+    if b2.button("Or load a real public filing: NSTAR Gas LDAC, D.P.U. 26-PGAF-NSTAR (corrected)", width="stretch"):
+        ss.use_real = True
         st.rerun()
 
 # index lives in this browser session only (never shared between visitors)
@@ -202,18 +209,50 @@ def figures_for(names: list[str]) -> list:
     """Extract figures for each named file once per model (or once by rules), reusing results."""
     for n in [n for n in names if (by_name[n][0], MODE) not in ss.figs]:
         h, d = by_name[n]
+        # numbered-line schedules are read cell by cell by the parser (exact, no AI);
+        # the model, or the no-AI patterns, handle everything else
+        sched = verify.schedule_figures(d)
+        rest = [c for c in d.chunks if not schedules.parse(c.text)]
         if not AI:
-            ss.figs[(h, MODE)] = rules.extract_figures(d.chunks)
+            ss.figs[(h, MODE)] = discovery.dedupe(sched + rules.extract_figures(rest))
             continue
-        numeric = [c for c in d.chunks if discovery.has_numbers(c)]
-        cost = max(1, len(discovery._batches(numeric, P.batch_chars)))
+        numeric = [c for c in rest if discovery.has_numbers(c)]
+        if not numeric:
+            ss.figs[(h, MODE)] = sched
+            continue
+        cost = max(1, len(discovery._batches(numeric, P.batch_tokens, llm.estimate_tokens)))
         with st.spinner(f"Extracting figures from {n} …"):
             out = run_ai(lambda client: discovery.extract_figures(
-                client, model, d.chunks, max_chars=P.batch_chars, max_tokens=P.max_tokens), cost)
+                client, model, rest, max_chars=P.batch_tokens, max_tokens=P.max_tokens, measure=llm.estimate_tokens), cost)
         if out is None:
             break
-        ss.figs[(h, MODE)] = out
+        ss.figs[(h, MODE)] = discovery.dedupe(sched + out)
     return [f for n in names for f in ss.figs.get((by_name[n][0], MODE), [])]
+
+
+def baseline_budget(p) -> int:
+    """Token budget for the whole-document baseline: what fits in one request."""
+    return p.request_tokens - p.max_tokens - 800 if p.request_tokens else p.context_tokens * 3
+
+
+def all_issues(names: list[str], figs: list) -> list:
+    """Figure checks plus schedule formula checks, most severe first."""
+    found = discovery.run_checks(figs) + verify.formula_issues(verify.formula_checks([by_name[n][1] for n in names]))
+    return sorted(found, key=lambda i: {"high": 0, "medium": 1, "low": 2}[i.severity])
+
+
+def show_number_checks(checks: list):
+    if not checks:
+        return
+    bad = [c for c in checks if c.status != "verified"]
+    if not bad:
+        st.success(f"✓ All {len(checks)} numbers in this answer appear in the sources it cites "
+                   "(and in the named rate class's column, where the source is a schedule).")
+        return
+    st.warning(f"⚠ {len(bad)} of {len(checks)} numbers in this answer could not be traced to their citation. "
+               "Check them against the filing before relying on them:")
+    label = {"wrong column": "wrong column", "other source": "not in the cited source", "not found": "not in the filings"}
+    st.markdown(md("\n".join(f"- **{c.number}** ({label[c.status]}): {c.detail}" for c in bad)))
 
 
 def docx_bytes(title: str, df: pd.DataFrame) -> bytes:
@@ -252,6 +291,7 @@ with tabs[0]:
         with st.chat_message(turn["role"]):
             st.markdown(md(turn["content"]))
             if turn["role"] == "assistant":
+                show_number_checks(turn.get("checks", []))
                 show_sources(turn.get("sources", []), turn["content"])
 
     SUGGEST = {
@@ -276,10 +316,11 @@ with tabs[0]:
         with st.chat_message("user"):
             st.markdown(md(question))
         if AI:
-            hits = index.search(question, files=scope or None, max_chars=P.context_chars)
+            hits = index.search(question, files=scope or None, max_chars=P.context_tokens, measure=llm.estimate_tokens)
         else:
             hits = sorted(index.search(question, k=3, files=scope or None, always_rank=True),
                           key=lambda h: -h[1])[:3]
+        checks = []
         with st.chat_message("assistant"):
             if not hits:
                 reply, sources = "I couldn't find anything relevant in the selected files.", []
@@ -297,15 +338,18 @@ with tabs[0]:
                 def ask(client):
                     stream, srcs = answer.stream_answer(
                         client, model, question, hits,
-                        [{"role": t["role"], "content": t["content"]} for t in ss.chat], P.max_tokens)
+                        [{"role": t["role"], "content": t["content"]} for t in ss.chat], P.max_tokens,
+                        P.history_turns)
                     return st.write_stream(md_stream(stream)).replace("\\$", "$"), srcs
                 out = run_ai(ask)
                 if out is None:
                     st.stop()
                 reply, sources = out
-                show_sources(sources, reply)
+            checks = verify.check_answer(reply, sources) if sources else []
+            show_number_checks(checks)
+            show_sources(sources, reply)
         ss.chat += [{"role": "user", "content": question},
-                    {"role": "assistant", "content": reply, "sources": sources}]
+                    {"role": "assistant", "content": reply, "sources": sources, "checks": checks}]
 
     if ss.chat:
         lines = []
@@ -339,14 +383,20 @@ with tabs[1]:
         if pick and (done or st.button("Extract key figures", type="primary")):
             figs = figures_for(pick)
             if figs:
-                issues = discovery.run_checks(figs)
-                ss.last_issues = issues
+                picked_docs = [by_name[n][1] for n in pick]
+                fchecks = verify.formula_checks(picked_docs)
+                issues = all_issues(pick, figs)
+                cov = verify.coverage(picked_docs, figs)
                 df = discovery.figures_frame(figs)
                 n_ok = int(df["verified"].sum())
-                c1, c2, c3 = st.columns(3)
+                n_tie = int((fchecks["Result"] != "✗ does not tie").sum())
+                n_cov = int(cov["In figures table"].sum())
+                c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Figures found", len(df))
                 c2.metric("Verified against the page", f"{n_ok}/{len(df)}")
-                c3.metric("Issues flagged", len(issues))
+                c3.metric("Schedule formulas that tie", f"{n_tie}/{len(fchecks)}" if len(fchecks) else "–")
+                c4.metric("Numbers in filing captured", f"{n_cov}/{len(cov)}" if len(cov) else "–")
+                c5.metric("Issues flagged", len(issues))
 
                 st.subheader("Checks")
                 if not issues:
@@ -354,6 +404,28 @@ with tabs[1]:
                 for i in issues:
                     where = f" — {i.file}, {', '.join(i.locations)}" if i.locations else (f" — {i.file}" if i.file else "")
                     st.markdown(md(f"{SEV[i.severity]} **{i.kind}** {i.description}{where}"))
+
+                if len(fchecks):
+                    with st.expander(f"Schedule formula checks ({n_tie} of {len(fchecks)} tie)",
+                                     expanded=n_tie < len(fchecks)):
+                        st.caption("Every formula written in a schedule (\"Sum of Line 5 through Line 18\", "
+                                   "\"Line 3 + Line 19 + …\") recomputed for every rate class. A difference of "
+                                   "one unit in the last decimal place is allowed for rounding of each filed figure.")
+                        st.dataframe(fchecks, hide_index=True, width="stretch",
+                                     column_config={c: st.column_config.NumberColumn(format="%g")
+                                                    for c in ("Filed", "Recomputed", "Difference")})
+                missed = cov[~cov["In figures table"]]
+                with st.expander(f"Coverage: numbers in the filing not in the figures table ({len(missed)})",
+                                 expanded=0 < len(missed) <= 40):
+                    st.caption("Every dollar amount, rate, percentage and large number on each page, checked "
+                               "against the figures table. Anything listed here was not extracted: review it "
+                               "or ask about it. Page, docket, line and year numbers are excluded.")
+                    if len(missed):
+                        st.dataframe(missed.drop(columns="In figures table"), hide_index=True, width="stretch")
+                        st.download_button("Download uncaptured numbers (CSV)", missed.to_csv(index=False).encode(),
+                                           file_name="numbers_not_captured.csv")
+                    else:
+                        st.success("Every number in the selected filings is in the figures table.")
 
                 st.subheader("Figures")
                 show = df.assign(metric=df["metric"].map(discovery.METRICS).fillna(df["metric"]),
@@ -388,13 +460,13 @@ with tabs[2]:
             issues = []
             if use_checks:
                 figs = figures_for(target)
-                issues = discovery.run_checks(figs) if figs else []
+                issues = all_issues(target, figs) if figs else []
             chunks_t = [c for n in target for c in by_name[n][1].chunks]
             if AI:
                 with st.spinner("Drafting …"):
                     out = run_ai(lambda client: discovery.draft_irs(
                         client, model, chunks_t, issues, prefix, int(set_no), int(n_req),
-                        max_chars=P.context_chars, max_tokens=P.max_tokens))
+                        max_chars=P.batch_tokens, max_tokens=P.max_tokens, measure=llm.estimate_tokens))
             else:
                 out = rules.draft_irs(figures_for(target), issues, " ".join(c.text for c in chunks_t),
                                       prefix, int(set_no), int(n_req))
@@ -434,11 +506,11 @@ with tabs[3]:
             chunks_r = [c for n in pick for c in by_name[n][1].chunks]
             n_ir = len(discovery.ir_groups(chunks_r))
             if AI:
-                n_calls = len(discovery.ir_batches(discovery.ir_groups(chunks_r), P.batch_chars))
+                n_calls = len(discovery.ir_batches(discovery.ir_groups(chunks_r), P.batch_tokens, measure=llm.estimate_tokens))
                 with st.spinner(f"Reviewing {n_ir} responses …"):
                     out = run_ai(lambda client: discovery.grade_responses(
                         client, model, chunks_r, [d.name for d in docs], drafted if check_drafts else None,
-                        max_chars=P.batch_chars, max_tokens=P.max_tokens), cost=max(1, n_calls))
+                        max_chars=P.batch_tokens, max_tokens=P.max_tokens, measure=llm.estimate_tokens), cost=max(1, n_calls))
             else:
                 out = rules.grade_responses(chunks_r, [d.name for d in docs], drafted if check_drafts else None)
             if out is not None:
@@ -512,8 +584,8 @@ with tabs[5]:
     base = c2.checkbox("Include whole-document baseline", value=True)
     if AI and P.free:
         st.caption(f"{P.name}'s free tier has a per-minute token limit, so scoring runs slowly and the "
-                   f"baseline is capped at {min(evaluate.BASELINE_CHARS, P.context_chars * 2):,} characters "
-                   "of each filing.")
+                   f"the baseline can only include about {baseline_budget(P):,} tokens of each filing, so on "
+                   "long filings it is not a fair comparison. Use Gemini or Claude for the baseline.")
     st.download_button("Template for scoring ChatGPT / Claude.ai by hand",
                        evaluate.manual_template(qs).encode(), file_name="manual_comparison.csv")
     if runnable:
@@ -528,8 +600,8 @@ with tabs[5]:
             bar = st.progress(0.0)
             res = run_ai(lambda client: evaluate.run(
                 runnable, all_chunks, client=client, model=model, k=int(k), baseline=base,
-                max_chars=P.context_chars, max_tokens=P.max_tokens,
-                baseline_chars=min(evaluate.BASELINE_CHARS, P.context_chars * 2),
+                max_chars=P.context_tokens, max_tokens=P.max_tokens, measure=llm.estimate_tokens,
+                baseline_chars=baseline_budget(P),
                 progress=lambda i, n, q: bar.progress(i / n, text=f"{q.id}: {q.question[:60]}")), cost)
             if res is not None:
                 ss.eval = evaluate.results_frame(res)

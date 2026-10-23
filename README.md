@@ -10,7 +10,7 @@ Drag in public utility filings submitted to the Massachusetts Department of Publ
 
 | Option | Cost | Notes |
 |---|---|---|
-| **Groq · GPT-OSS 120B / Llama 3.3 70B** | Free tier | Open models. The free tier's per-minute token limit means the app sends smaller excerpts |
+| **Groq · GPT-OSS 120B / Llama 3.3 70B** | Free tier | Open models. The free tier allows about 8,000 tokens per minute, so the app budgets every request in tokens (number-heavy schedules use about 1 token per 2 characters), sends at most two earlier chat turns, and stops oversized requests before sending them |
 | **Gemini Flash** | Free tier | On the free tier, Google may use inputs to improve its models |
 | **Claude Sonnet / Haiku / Opus 5.5** | Paid API | Strongest on drafting and extraction |
 | **No AI** | Free, no key | Search with highlighted passages, figures from tables and standard wording, the same arithmetic checks, template IRs, response checks, comparison, retrieval scoring |
@@ -27,7 +27,21 @@ The app picks the first provider with a key in Secrets (Groq, then Claude, then 
   - Docket numbers (e.g. D.P.U. 25-PGAF-GRID) and document type (GAF filing, rate case, IR response) are detected automatically.
 - **Cited answers:** the model answers only from the retrieved excerpts, quotes figures exactly as filed, flags conflicts between an original and a revision, and says so when the filings don't contain the answer. Click "Sources cited" to read each excerpt.
 - **Scope and export:** limit questions to selected files, and download the Q&A with citations.
-- **Try it without your own files:** one click loads three fictional sample filings.
+- **Try it without your own files:** one click loads three fictional sample filings, or a real public NSTAR Gas LDAC filing.
+
+## Verification: no unflagged mistakes, no silent misses
+
+No AI system, and no analyst, is right 100% of the time. The app is built so that every mistake or miss is shown to you rather than hidden. None of these checks use AI:
+
+| Check | What it does |
+|---|---|
+| **Schedule parser** | Numbered-line schedules (e.g. the LDAC summary: 22 lines × 10 rate classes) are read cell by cell by code, so the AI never extracts table cells. The column header is repeated in every excerpt, so the model always knows which rate class a number belongs to. |
+| **Formula checks** | Every formula written in a schedule, e.g. "Sum of Line 5 through Line 18" or "Line 3 + Line 19 + Line 20 + Line 21", is recomputed for every rate class. A difference of one unit in the last decimal is reported as rounding; anything larger is a high-severity issue. |
+| **Quote verification** | Every extracted figure's quote and number must appear on the cited page, or the figure is marked ✗. |
+| **Coverage** | Lists every dollar amount, rate, percentage and large number in the filing that is *not* in the figures table, with page, line and rate class. Nothing the extraction skipped goes unnoticed. |
+| **Answer check** | Every number in a chat answer is looked up in the source it cites. If the sentence names a rate class and the source is a schedule, the number must be in that class's column. Otherwise the answer gets a warning: "not in the cited source", "wrong column" or "not in the filings (check the arithmetic)". |
+
+Tested on a real public filing included in `samples/`: NSTAR Gas LDAC, D.P.U. 26-PGAF-NSTAR (corrected). All 220 numbers were captured and verified, and all 20 formula checks tie. Corrupted copies in `tests/test_verify.py` show each check catching its error: a total changed by $0.01, a one-unit rounding difference, a skipped line, an answer quoting the C&I rate as residential, and an answer citing the wrong source.
 
 ## Discovery tools
 
@@ -76,12 +90,13 @@ question → keyword search (BM25) tuned for docket/IR numbers, rate classes and
 | `rag/search.py` | BM25 search with a filing-aware tokenizer; IR-number boosting; whole-document mode for small uploads |
 | `rag/llm.py` | Providers (Groq, Gemini, Anthropic), size budgets, OpenAI-compatible adapter, error messages |
 | `rag/answer.py` | Prompt, streaming answer, citation parsing |
+| `rag/schedules.py`, `rag/verify.py` | Schedule parser, formula checks, coverage report, answer number check |
 | `rag/rules.py` | No-AI mode: pattern-based figures, template IRs, response checks, passage highlighting |
 | `rag/discovery.py` | Figure extraction (tool use + verbatim verification), checks, IR drafting, response grading, comparison |
 | `rag/evaluate.py`, `eval/` | Question sets, scoring, baseline, reports |
 | `app.py` | Streamlit interface: upload, Ask, Key figures, Draft IRs, Track responses, Compare, Evaluation |
 | `samples/` | Fictional sample filings (`make_samples.py` regenerates them) |
-| `tests/` | 29 tests on ingestion, search, prompts, discovery, scoring, the Groq/Gemini adapter and no-AI mode (the API is faked, so tests are free) |
+| `tests/` | 44 tests on ingestion, search, prompts, discovery, scoring, the Groq/Gemini adapter, no-AI mode and verification (the API is faked, so tests are free) |
 
 Scanned PDFs without a text layer are flagged; run OCR first for those pages to be searchable.
 

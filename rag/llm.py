@@ -24,24 +24,28 @@ class Provider:
     key_name: str              # secret / environment variable holding the key
     key_url: str
     base_url: str | None       # None = Anthropic SDK
-    context_chars: int         # excerpt budget for one question
-    batch_chars: int           # excerpt budget for one extraction call
+    context_tokens: int        # excerpt budget for one question (estimated tokens)
+    batch_tokens: int          # excerpt budget for one extraction / drafting call
     max_tokens: int            # output budget
     free: bool
     data_note: str
+    history_turns: int = 6     # earlier chat turns sent with a question
+    request_tokens: int | None = None   # hard cap per request (input + output), if the provider has one
 
 
 PROVIDERS = {
     "groq": Provider("Groq", "GROQ_API_KEY", "console.groq.com/keys", "https://api.groq.com/openai/v1",
-                     context_chars=14_000, batch_chars=12_000, max_tokens=1500, free=True,
-                     data_note="Excerpts are sent to Groq to generate results."),
+                     context_tokens=3_000, batch_tokens=2_500, max_tokens=1_200, free=True,
+                     data_note="Excerpts are sent to Groq to generate results.",
+                     # free tier: 8,000 tokens per minute, counting the requested output allowance
+                     history_turns=2, request_tokens=6_500),
     "gemini": Provider("Google Gemini", "GEMINI_API_KEY", "aistudio.google.com/apikey",
                        "https://generativelanguage.googleapis.com/v1beta/openai/",
-                       context_chars=100_000, batch_chars=40_000, max_tokens=3000, free=True,
+                       context_tokens=25_000, batch_tokens=10_000, max_tokens=3_000, free=True,
                        data_note="Excerpts are sent to Google. On Gemini's free tier, Google may use "
                                  "inputs to improve its models and human reviewers may read them."),
     "anthropic": Provider("Anthropic", "ANTHROPIC_API_KEY", "console.anthropic.com", None,
-                          context_chars=120_000, batch_chars=60_000, max_tokens=4000, free=False,
+                          context_tokens=30_000, batch_tokens=15_000, max_tokens=4_000, free=False,
                           data_note="Excerpts are sent to the Anthropic API to generate results."),
 }
 
@@ -56,6 +60,24 @@ MODELS = {
 }
 NO_AI = "No AI · search and checks only"
 PREFERENCE = ["groq", "anthropic", "gemini"]       # default when several keys are configured
+
+
+_TOKEN = re.compile(r"[A-Za-z]+|\d{1,3}|[^\sA-Za-z\d]")
+
+
+def estimate_tokens(text: str) -> int:
+    """Conservative token estimate without downloading a tokenizer.
+    Words count once, digits in groups of three, and each symbol ($ . , | ( ) once, plus 25% margin.
+    Number-heavy schedules come out near 1 token per 2.5 characters; prose near 1 per 4."""
+    return int(len(_TOKEN.findall(text or "")) * 1.25) + 4
+
+
+def _messages_tokens(messages) -> int:
+    return sum(estimate_tokens(str(m.get("content", ""))) + 4 for m in messages)
+
+
+class TooLarge(Exception):
+    """Raised before sending when a request cannot fit the provider's per-request cap."""
 
 
 def make_client(provider: str, key: str):
@@ -120,8 +142,26 @@ class OpenAICompat:
         return [{"role": "system", "content": system}] + [
             {"role": m["role"], "content": m["content"]} for m in messages]
 
+    def _fit(self, kw: dict, extra_tokens: int = 0) -> dict:
+        """Last guard before sending: keep input + output under the provider's per-request cap.
+        Drops earlier chat turns first, then lowers the output allowance; never cuts the sources."""
+        cap = PROVIDERS[self.provider].request_tokens
+        if not cap:
+            return kw
+        msgs = kw["messages"]
+        size = lambda: _messages_tokens(msgs) + extra_tokens
+        while size() + kw["max_tokens"] > cap and len(msgs) > 2:
+            del msgs[1]                                  # oldest turn after the system prompt
+        room = cap - size()
+        if room < 400:
+            raise TooLarge(f"This request needs about {size():,} tokens of input, more than "
+                           f"{PROVIDERS[self.provider].name}'s free-tier limit allows in one request.")
+        kw["max_tokens"] = min(kw["max_tokens"], room)
+        return kw
+
     def create(self, model, max_tokens, system, messages, tools=None, tool_choice=None, **_):
         kw = dict(model=model, max_tokens=max_tokens, messages=self._msgs(system, messages), **self._extra(model))
+        kw = self._fit(kw, extra_tokens=sum(estimate_tokens(json.dumps(t)) for t in tools or []))
         if tools:
             kw["tools"] = [_to_openai_tool(t) for t in tools]
             name = tool_choice.get("name") if isinstance(tool_choice, dict) else None
@@ -154,9 +194,8 @@ class OpenAICompat:
         return NS(content=blocks)
 
     def stream(self, model, max_tokens, system, messages, **_):
-        return _Stream(self._c.chat.completions.create(
-            model=model, max_tokens=max_tokens, messages=self._msgs(system, messages), stream=True,
-            **self._extra(model)))
+        kw = self._fit(dict(model=model, max_tokens=max_tokens, messages=self._msgs(system, messages)))
+        return _Stream(self._c.chat.completions.create(stream=True, **kw, **self._extra(model)))
 
 
 # --------------------------------------------------------------------------
@@ -169,6 +208,10 @@ def _is_bad_request(e) -> bool:
 def describe_error(e: Exception, provider: str) -> str:
     kind = type(e).__name__
     p = PROVIDERS[provider]
+    if kind == "TooLarge" or getattr(e, "status_code", None) == 413 or "Request too large" in str(e):
+        return (f"This request is too large for {p.name}'s free tier (about 8,000 tokens per minute). "
+                "Select fewer files under 'Search within', ask about one schedule at a time, or pick "
+                "Gemini or Claude for large filings.")
     if kind in ("AuthenticationError", "PermissionDeniedError"):
         return f"The {p.name} API key was rejected. Check it in the sidebar or the {p.key_name} secret."
     if kind == "RateLimitError":

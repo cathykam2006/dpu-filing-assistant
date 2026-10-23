@@ -34,9 +34,9 @@ def build_context(hits: list[tuple[Chunk, float]]) -> tuple[str, list[Chunk]]:
     return "\n\n".join(parts), sources
 
 
-def build_messages(question: str, context: str, history: list[dict]) -> list[dict]:
+def build_messages(question: str, context: str, history: list[dict], turns: int = 6) -> list[dict]:
     msgs = []
-    for turn in history[-6:]:              # short memory for follow-up questions
+    for turn in (history[-turns:] if turns > 0 else []):   # short memory for follow-up questions
         msgs.append({"role": turn["role"], "content": turn["content"]})
     msgs.append({"role": "user", "content":
                  f"Sources from the uploaded filings:\n\n{context}\n\nQuestion: {question}"})
@@ -44,9 +44,9 @@ def build_messages(question: str, context: str, history: list[dict]) -> list[dic
 
 
 def stream_answer(client, model: str, question: str, hits, history: list[dict],
-                  max_tokens: int = 1500) -> tuple[Iterator[str], list[Chunk]]:
+                  max_tokens: int = 1500, history_turns: int = 6) -> tuple[Iterator[str], list[Chunk]]:
     context, sources = build_context(hits)
-    messages = build_messages(question, context, history)
+    messages = build_messages(question, context, history, history_turns)
 
     def gen():
         with client.messages.stream(model=model, max_tokens=max_tokens, system=SYSTEM,

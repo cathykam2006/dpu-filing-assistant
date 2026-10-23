@@ -61,8 +61,9 @@ def main():
         client = llm.make_client(provider, key)
 
     res = evaluate.run(qs, chunks, client=client, model=model_id, k=a.k, baseline=a.baseline,
-                       max_chars=p.context_chars, max_tokens=p.max_tokens,
-                       baseline_chars=min(evaluate.BASELINE_CHARS, p.context_chars * 2),
+                       max_chars=p.context_tokens, max_tokens=p.max_tokens, measure=llm.estimate_tokens,
+                       baseline_chars=p.request_tokens - p.max_tokens - 800 if p.request_tokens
+                       else p.context_tokens * 3,
                        progress=lambda i, n, q: print(f"  [{i}/{n}] {q.id} {q.question[:70]}"))
     df = evaluate.results_frame(res)
     out = Path(a.out)
