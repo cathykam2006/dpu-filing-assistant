@@ -2,7 +2,7 @@
 
 Drag in public utility filings submitted to the Massachusetts Department of Public Utilities (gas adjustment factor filings, LDAF filings, rate cases, information-request responses), ask questions in plain English, and run the routine parts of case discovery: pull key figures with automatic checks, draft information requests, track responses and compare filings. Everything cites the exact file, page, sheet or IR it came from, and an evaluation harness measures how often it is right.
 
-**Live app:** _add your Streamlit link here_ · **Author:** Cathy Kam
+**Live app:** [Open the app](https://dpu-filing-assistant-6tsrcudhmux8mpakqcnlux.streamlit.app/) [![Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://dpu-filing-assistant-6tsrcudhmux8mpakqcnlux.streamlit.app/) · **Author:** Cathy Kam
 
 > **Public filings only.** Files are processed in memory for the browser session and are not stored. Questions and the matching excerpts are sent to the Anthropic API to generate answers. Do not upload confidential or redacted material.
 
