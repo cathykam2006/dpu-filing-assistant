@@ -291,12 +291,22 @@ def check_document(ref: str, filing: list[Document]) -> Item:
     return Item("document", ref, "missing", "", "not in the filing")
 
 
+LABELLED_DATE = re.compile(rf"\b(?:filed|dated|date|submitted)\s*:\s*((?:{MONTHS})(?:\s+\d{{1,2}},)?\s+\d{{4}})",
+                           re.I)
+
+
 def filing_date(filing: list[Document]) -> tuple[str, str] | None:
-    for d in filing:
-        for loc, text in page_texts(d):
-            m = FILED_DATE.search(text)
-            if m:
-                return m.group(1), f"{d.name} · {loc}"
+    """The filing's own date: a labelled "Filed: …" / "Dated: …" first; otherwise "filed …" on a line that is
+    not citing another docket (schedules often say "D.P.U. 26-99 filed July 30, 2026")."""
+    for pattern, skip_citations in ((LABELLED_DATE, False), (FILED_DATE, True)):
+        for d in filing:
+            for loc, text in page_texts(d):
+                for ln in text.splitlines():
+                    if skip_citations and re.search(r"D\.\s?P\.\s?U\.|D\.T\.E\.", ln):
+                        continue
+                    m = pattern.search(ln)
+                    if m:
+                        return m.group(1), f"{d.name} · {loc}"
     return None
 
 
@@ -483,14 +493,40 @@ def results_frame(reqs: list[Requirement], index=None, files=None) -> pd.DataFra
     return df.assign(_r=df["Status"].map(rank).fillna(99)).sort_values(["_r", "ID"]).drop(columns="_r")
 
 
-def follow_up_irs(df: pd.DataFrame, prefix: str = "DPU", set_no: int = 1, start: int = 1) -> pd.DataFrame:
-    """Template information requests for every requirement not shown as met."""
+def order_reference(doc: Document) -> str:
+    """How a request cites an order or cover letter: 'the Department’s Order in D.P.U. 98-PGAF-SAMPLE'."""
+    text = " ".join(t for _, t in page_texts(doc))[:6000]
+    if ENCLOSED.search(text) and not re.search(r"\bORDER\b", text):
+        return "the Company’s filing cover letter"
+    if doc.dockets and re.search(r"\border\b", text, re.I):
+        return f"the Department’s Order in D.P.U. {doc.dockets[0]}"
+    return doc.name
+
+
+def follow_up_irs(df: pd.DataFrame, prefix: str = "DPU", set_no: int = 1, start: int = 1,
+                  refs: dict[str, str] | None = None, filing_ref: str = "the Company’s filing") -> pd.DataFrame:
+    """Information requests, in the Department's format, for every requirement not shown as met.
+    refs maps an order / cover-letter file name to how it is cited."""
+    from .irformat import compose, label, pinpoint
+    refs = refs or {}
     rows = []
     for _, r in df[~df["Status"].str.startswith("✓")].iterrows():
-        what = r["Discrepancy / what to check"] or "the filing does not show how this requirement is met"
-        rows.append({"No.": f"{prefix}-{set_no}-{start + len(rows)}", "Topic": f"Compliance ({r['ID']})",
-                     "Request": f"Refer to {r['From']}, which states: \"{r['Requirement'][:300]}\" "
-                                f"Please identify where the filing complies with this requirement, or explain "
-                                f"why it does not and provide the missing information. ({what[:200]})",
+        file, _, loc = str(r["From"]).partition(" · ")
+        where = " ".join(x for x in (refs.get(file, file), pinpoint(loc)) if x)
+        enclosure = str(r["Requirement"]).startswith("Cover letter lists as enclosed: ")
+        quote = str(r["Requirement"]).replace("Cover letter lists as enclosed: ", "")[:300].rstrip(".")
+        what = re.sub(r"^\S+: (?=the order|not in|mentioned)", "", str(r["Discrepancy / what to check"]))[:220]
+        if r["Status"] == "✗ Discrepancy":
+            ask = (f"Please explain why {filing_ref} differs from this requirement ({what.rstrip('.')}), and "
+                   "provide corrected schedules, if necessary.")
+        elif enclosure:
+            ask = f"Please provide this document, which does not appear in {filing_ref}."
+        else:
+            ask = (f"Please identify where {filing_ref} complies with this requirement or, if it does not, "
+                   "explain why and provide the missing information.")
+        cited = (f"Refer to {where}, which lists “{quote}” as enclosed." if enclosure
+                 else f"Refer to {where}, which states: “{quote}.”")
+        rows.append({"No.": label(prefix, set_no, start + len(rows)), "Topic": f"Compliance ({r['ID']})",
+                     "Request": compose("", f"{cited}  {ask}"),
                      "Why": f"Compliance check: {r['Status']}", "Based on": r["From"]})
     return pd.DataFrame(rows, columns=["No.", "Topic", "Request", "Why", "Based on"])

@@ -127,7 +127,8 @@ def test_rules_ir_templates():
     bad = [D.Figure(**{**f.__dict__, "value": 150_000_000}) if f.metric == "cost_of_gas_total" else f
            for f in figs]
     df = rules.draft_irs(bad, D.run_checks(bad), " ".join(c.text for c in chunks), "DPU", 3, 8)
-    assert df["No."].iloc[0] == "DPU-3-1" and df["Topic"].iloc[0] == "Cost of gas tie-out"
+    assert df["No."].iloc[0] == "DPU 3-1" and df["Topic"].iloc[0] == "Cost of gas tie-out"
+    assert all(r.startswith("Refer to ") for r in df["Request"])
     assert any("Hedging" == t for t in df["Topic"])                     # hedging not mentioned in filing
     assert any("4,817,420" in r for r in df["Request"]) and len(df) <= 8
 

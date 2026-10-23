@@ -1,5 +1,6 @@
 """Discovery and evaluation tests. Claude is replaced by a fake that returns tool-use blocks,
 so these check the plumbing, verification and arithmetic, not model quality."""
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -125,10 +126,12 @@ def test_draft_irs_numbering_and_citations():
     issues = [D.Issue("missing", "low", "No typical customer bill impact found.", "x.pdf")]
     client = FakeTools({"record_requests": reqs})
     df = D.draft_irs(client, "m", chunks, issues, prefix="DPU", set_no=2)
-    assert list(df["No."]) == ["DPU-2-1", "DPU-2-2"]
+    assert list(df["No."]) == ["DPU 2-1", "DPU 2-2"]                    # the Department's numbering
     assert "p. 2 (table)" in df["Based on"].iloc[1] and "99" not in df["Based on"].iloc[1]
-    assert "No typical customer bill impact" in client.calls[0]["messages"][0]["content"]
-    assert "Information Request DPU-2-1" in D.irs_to_text(df)
+    prompt = client.calls[0]["messages"][0]["content"]
+    assert "No typical customer bill impact" in prompt and "How to cite each file" in prompt
+    assert df["Request"].iloc[0].startswith("Refer to page 1.  Please explain")
+    assert "DPU 2-1" in D.irs_to_text(df) and "FIRST SET OF INFORMATION REQUESTS" in D.irs_to_text(df)
 
 
 def test_grade_responses_flags_missing_attachment_and_unanswered():
@@ -209,6 +212,6 @@ def test_edited_ir_table_with_blank_and_added_rows():
         {"No.": None, "Topic": "Added", "Request": "Provide workpapers.", "Why": "", "Based on": None},
     ])
     clean = D.clean_irs(df, "DPU", 1)
-    assert list(clean["No."]) == ["DPU-1-1", "DPU-1-2"] and clean["Why"].iloc[0] == ""
+    assert list(clean["No."]) == ["DPU-1-1", "DPU 1-2"] and clean["Why"].iloc[0] == ""
     text = D.irs_to_text(df, "Set 1")
-    assert "Information Request DPU-1-2\nProvide workpapers." in text and "None" not in text
+    assert re.search(r"DPU 1-2 +Provide workpapers\.", text) and "None" not in text

@@ -170,8 +170,9 @@ EXTRACT_SYSTEM = """You extract figures from public utility filings submitted to
 Record every material figure in the excerpts: GAF and LDAF rates by rate class (proposed and prior), \
 cost-of-gas components and totals, prior-period reconciliation balances, forecast sales, typical bill \
 impacts, revenue requirements and returns. Copy each number exactly as filed. The quote must be copied \
-verbatim from the source so it can be checked automatically. Do not compute, infer or round. Skip page \
-numbers, dates, docket numbers and line numbers."""
+verbatim from the source so it can be checked automatically; keep it short (the table row or the phrase \
+holding the number, under 120 characters). Do not compute, infer or round. Skip page numbers, dates, docket \
+numbers and line numbers."""
 
 
 def _to_float(v) -> float | None:
@@ -188,13 +189,19 @@ def extract_figures(client, model: str, chunks: list[Chunk], max_chars: int = 60
                     max_tokens: int = 4000, measure=len) -> list[Figure]:
     numeric = [c for c in chunks if has_numbers(c)]
     figures: list[Figure] = []
-    for batch in _batches(numeric, max_chars, measure):
+    queue = _batches(numeric, max_chars, measure)
+    while queue:
+        batch = queue.pop(0)
         out = _call_tool(client, model, EXTRACT_SYSTEM,
                          f"Filing excerpts:\n\n{_sources_block(batch)}", FIGURE_TOOL, max_tokens)
+        if out.get("_partial") and len(batch) > 1:      # output was cut off: redo the batch in halves
+            half = len(batch) // 2
+            queue[:0] = [batch[:half], batch[half:]]
         for f in out.get("figures", []) or []:
             if not isinstance(f, dict):
                 continue
-            sid, val = _to_float(f.get("source_id", 0)), _to_float(f.get("value"))
+            sid = f.get("source_id", f.get("sourceid", f.get("sourceId", 0)))
+            sid, val = _to_float(sid), _to_float(f.get("value"))
             if sid is None or val is None or not 1 <= int(sid) <= len(batch):
                 continue
             sid = int(sid)
@@ -287,73 +294,91 @@ def run_checks(figs: list[Figure]) -> list[Issue]:
 # --------------------------------------------------------------------------
 IR_TOOL = {
     "name": "record_requests",
-    "description": "Record draft information requests.",
+    "description": "Record draft information requests in the Department's format.",
     "input_schema": {
         "type": "object",
         "properties": {"requests": {"type": "array", "items": {
             "type": "object",
             "properties": {
-                "topic": {"type": "string"},
-                "request": {"type": "string", "description": "The request text in DPU style"},
+                "topic": {"type": "string", "description": "Two to four words"},
+                "refer_to": {"type": "string", "description": "What to cite, without the words 'Refer to': the "
+                             "document as given in the citations list plus a pinpoint, e.g. \"the Company’s "
+                             "September 17, 2026 Peak GAF filing at Schedule 2, Line 4\""},
+                "request": {"type": "string", "description": "The request after the citation, beginning "
+                            "'Please ...' (or a short context sentence then 'Please ...'). If there are "
+                            "subparts, end with 'please provide' or 'Please explain' and put them in subparts"},
+                "subparts": {"type": "array", "items": {"type": "string"},
+                             "description": "Optional (a), (b), ... items, each a lowercase phrase, no numbering"},
                 "rationale": {"type": "string", "description": "Why staff would ask this (one sentence)"},
                 "source_ids": {"type": "array", "items": {"type": "integer"}},
             },
-            "required": ["topic", "request", "rationale", "source_ids"]}}},
+            "required": ["topic", "refer_to", "request", "rationale", "source_ids"]}}},
         "required": ["requests"]},
 }
 
-IR_SYSTEM = """You assist Massachusetts DPU staff in drafting information requests (discovery) on \
-public utility filings. Write requests in the style used in DPU proceedings: specific, neutral, \
-one subject per request, referring to the page, schedule or line that prompts it ("Refer to page 2 \
-of the filing. Please explain...", "Please provide the workpapers supporting...", "Please reconcile..."). \
-Prioritize: figures that do not tie out, large changes, unexplained drivers, missing support or \
-workpapers, assumptions behind forecasts, and bill impacts. Do not ask for information the excerpts \
-already provide. Cite the source ids each request relies on."""
+IR_SYSTEM = """You assist Massachusetts DPU staff in drafting information requests on public utility \
+filings, in the format of the Department's issued requests. Rules:
+- One subject per request. Begin by citing the document and pinpoint (page, section, schedule, line), \
+using the citation given for each file; then make the request with "Please provide", "Please explain", \
+"Please identify", "Please reconcile" or "Please describe".
+- Use subparts (a), (b), ... when asking for several related items; each subpart is a lowercase phrase \
+(the formatting of "; and" and the final period is added for you). Do not use a single subpart.
+- Neutral and specific. Name the rate classes (e.g., R-3, G-41), periods and effective dates.
+- Write "percent", not "%". Write dates in full (November 1, 2026). Refer to earlier requests as \
+"information request DPU 1-1".
+- Prioritize: figures or schedules that do not tie, large changes, unexplained drivers, missing \
+workpapers or support, forecast assumptions, and bill impacts. Do not ask for what the excerpts already provide.
+
+Two requests the Department has issued, for style:
+Refer to the Company’s September 17, 2026 Peak GAF filing, the Company’s August 3, 2026 LDAF filing, any \
+revisions to the Company’s GAF or LDAF filings, and the Company’s response to information request DPU 1-1.  \
+For each illustrative residential LDAF that the Company calculated to reallocate 30, 40, and 50 percent of \
+costs, please provide: (a) updated residential bill impacts to also include the impact due to the proposed \
+peak GAF; and (b) an updated residential “all-in” bill impact analysis, comparing all proposed peak rates \
+for effect November 1, 2026, to those rates that were in effect on November 1, 2025.
+Refer to the Company’s September 17, 2026 gas adjustment factor (“GAF”) filing cover letter at 1, 3, the \
+Company’s September 17, 2026 GAF filing, Section VI, and the Department’s order in Natural Gas Unbundling, \
+D.T.E. 04-1, at 45-47 (2005).  Please explain how the Company recovers costs associated with the variance \
+between non-daily metered actual customer usage and the adjusted target values."""
 
 
 def draft_irs(client, model: str, chunks: list[Chunk], issues: list[Issue], prefix: str = "DPU",
               set_no: int = 1, n: int = 10, max_chars: int = 70_000, max_tokens: int = 4000,
-              measure=len) -> pd.DataFrame:
+              measure=len, refs: dict[str, str] | None = None) -> pd.DataFrame:
+    from .irformat import compose, label
+    refs = refs or {}
+    cites = "\n".join(f"- {f}: cite as “{r}”" for f, r in refs.items()) or "- cite each file as “the Company’s filing”"
     flagged = "\n".join(f"- [{i.severity}] {i.description} ({i.file}, {', '.join(i.locations)})"
                         for i in issues if i.kind != "unverified") or "- (no automated findings)"
-    batch = _batches(chunks, max(1, max_chars - measure(flagged)), measure)[0] if chunks else []
+    head = f"How to cite each file:\n{cites}\n\nAutomated review findings:\n{flagged}"
+    batch = _batches(chunks, max(1, max_chars - measure(head)), measure)[0] if chunks else []
     out = _call_tool(client, model, IR_SYSTEM,
-                     f"Automated review findings:\n{flagged}\n\nFiling excerpts:\n\n{_sources_block(batch)}"
+                     f"{head}\n\nFiling excerpts:\n\n{_sources_block(batch)}"
                      f"\n\nDraft up to {n} information requests, most important first.", IR_TOOL, max_tokens)
     rows = []
     reqs = [r for r in out.get("requests", []) or [] if isinstance(r, dict) and r.get("request")]
     for k, r in enumerate(reqs[:n], start=1):
         ids = [int(x) for x in (r.get("source_ids") or []) if _to_float(x) is not None]
-        cites = [batch[s - 1].citation() for s in ids if 1 <= s <= len(batch)]
-        rows.append({"No.": f"{prefix}-{set_no}-{k}", "Topic": r.get("topic", ""),
-                     "Request": r.get("request", ""), "Why": r.get("rationale", ""),
-                     "Based on": "; ".join(cites)})
+        based = [batch[s - 1].citation() for s in ids if 1 <= s <= len(batch)]
+        subs = [str(x) for x in (r.get("subparts") or []) if str(x).strip()]
+        text = compose(str(r.get("refer_to", "") or ""), str(r.get("request", "")), subs if len(subs) > 1 else None)
+        if len(subs) == 1:                                   # a single subpart is folded into the request
+            text = text.rstrip(".:") + " " + subs[0].rstrip(".") + "."
+        rows.append({"No.": label(prefix, set_no, k), "Topic": r.get("topic", ""),
+                     "Request": text, "Why": r.get("rationale", ""), "Based on": "; ".join(based)})
     return pd.DataFrame(rows, columns=["No.", "Topic", "Request", "Why", "Based on"])
 
 
 def clean_irs(df: pd.DataFrame, prefix: str = "DPU", set_no: int = 1) -> pd.DataFrame:
-    """Tidy the edited IR table: empty cells become "", rows without a request are dropped,
-    and rows added without a number get the next one in the set."""
-    cols = ["No.", "Topic", "Request", "Why", "Based on"]
-    df = df.reindex(columns=cols).astype(object).where(df.reindex(columns=cols).notna(), "")
-    df = df.map(lambda v: str(v).strip())
-    df = df[df["Request"] != ""].reset_index(drop=True)
-    used = {n for n in df["No."] if n}
-    k = 1
-    for i in df.index:
-        if not df.at[i, "No."]:
-            while f"{prefix}-{set_no}-{k}" in used:
-                k += 1
-            df.at[i, "No."] = f"{prefix}-{set_no}-{k}"
-            used.add(df.at[i, "No."])
-    return df
+    """Tidy the edited IR table (empty rows dropped, new rows numbered, format re-applied)."""
+    from .irformat import IRSet, clean
+    return clean(df, IRSet(prefix=prefix, set_no=set_no))
 
 
-def irs_to_text(df: pd.DataFrame, header: str = "") -> str:
-    lines = [header] if header else []
-    for _, r in clean_irs(df).iterrows():
-        lines += [f"Information Request {r['No.']}", r["Request"], ""]
-    return "\n".join(lines)
+def irs_to_text(df: pd.DataFrame, header: str = "", meta=None) -> str:
+    """Plain-text set in the Department's format (see rag/irformat.py)."""
+    from .irformat import IRSet, to_text
+    return to_text(df, meta or IRSet())
 
 
 # --------------------------------------------------------------------------
@@ -420,9 +445,11 @@ def ir_batches(groups: dict[str, list[Chunk]], max_chars: int, max_items: int = 
 
 
 def add_unanswered(rows: list[dict], groups, drafted) -> pd.DataFrame:
+    from .irformat import normalize_id
+    answered = {normalize_id(g) for g in groups}
     for ir in drafted or []:
-        if ir.upper() not in groups:
-            rows.append({"IR": ir.upper(), "Status": "no response found", "Summary": "", "Gaps": "",
+        if normalize_id(ir) not in answered:
+            rows.append({"IR": ir, "Status": "no response found", "Summary": "", "Gaps": "",
                          "Attachments not uploaded": "", "Suggested follow-up": "", "Where": ""})
     return pd.DataFrame(rows, columns=GRADE_COLS)
 

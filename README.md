@@ -55,6 +55,20 @@ Tested on a real public filing included in `samples/`: NSTAR Gas LDAC, D.P.U. 26
 
 Draft IRs are a starting point for staff review. This demo is intended for public filings.
 
+## Information requests in the Department's format
+
+Drafts follow the format of information requests the Department has issued in public dockets. The reference is the second set of common information requests in the D.P.U. 26-PGAF dockets (October 2, 2026):
+
+- **Title block:** centered: "SECOND SET OF INFORMATION REQUESTS OF THE / DEPARTMENT OF PUBLIC UTILITIES / TO … / D.P.U. …", with a rule underneath.
+- **Opening paragraph:** "Pursuant to 220 CMR 1.06(5)(c), the Department … submits to … (“Company”) its second set of Information Requests."
+- **Requests:** a bold, underlined **Requests** heading. Each request has its number ("DPU 2-1") at the margin and the text on a hanging indent 1 inch in.
+- **Wording:** each request opens "Refer to <document> at <page, section, schedule or line>" and then asks "Please …".
+- **Subparts:** (a), (b) … with the text 1.5 inches in. Each starts lowercase and ends with ";", with "; and" before the last and "." at the end.
+- **Style:** curly quotes, "percent" rather than "%", "e.g.,", two spaces between sentences, and dates in full.
+- **Close and header:** "Dated: …" at the end, and a running header "D.P.U. … Page N" from page 2.
+
+`rag/irformat.py` applies all of this. That covers drafts from the model, the no-AI templates, follow-ups from Track responses and Compliance, and your own edits in the table. A format check flags what can't be fixed automatically, such as a missing "Refer to …" or a missing pinpoint. A test rebuilds the published request DPU-LDC 2-1 and confirms the output matches the issued text word for word. Downloads are Word (Times New Roman 12, the layout above), text and CSV. Every draft is marked **DRAFT — not issued** and carries no seal or letterhead.
+
 ## Evaluation
 
 `eval/questions_sample.csv` holds 17 questions on the sample filings with known answers, including two whose correct answer is "the filings don't say". Each question lists the expected figures and where they are.
@@ -92,13 +106,14 @@ question → keyword search (BM25) tuned for docket/IR numbers, rate classes and
 | `rag/llm.py` | Providers (Groq, Gemini, Anthropic), size budgets, OpenAI-compatible adapter, error messages |
 | `rag/answer.py` | Prompt, streaming answer, citation parsing |
 | `rag/schedules.py`, `rag/verify.py` | Schedule parser, formula checks, coverage report, answer number check |
+| `rag/irformat.py` | The Department's IR format: composing, style, format check, Word and text layout |
 | `rag/compliance.py` | Requirements from orders and cover letters, code checks, model judgement, combined status, follow-up IRs |
 | `rag/rules.py` | No-AI mode: pattern-based figures, template IRs, response checks, passage highlighting |
 | `rag/discovery.py` | Figure extraction (tool use + verbatim verification), checks, IR drafting, response grading, comparison |
 | `rag/evaluate.py`, `eval/` | Question sets, scoring, baseline, reports |
 | `app.py` | Streamlit interface: upload, Ask, Key figures, Draft IRs, Track responses, Compare, Evaluation |
 | `samples/` | Fictional sample filings (`make_samples.py` regenerates them) |
-| `tests/` | 53 tests on ingestion, search, prompts, discovery, scoring, the Groq/Gemini adapter, no-AI mode, verification and compliance checks (the API is faked, so tests are free) |
+| `tests/` | 68 tests on ingestion, search, prompts, discovery, scoring, the Groq/Gemini adapter, no-AI mode, verification, compliance checks and the IR format (the API is faked, so tests are free) |
 
 Scanned PDFs without a text layer are flagged; run OCR first for those pages to be searchable.
 
@@ -121,6 +136,7 @@ streamlit run app.py
 ## Troubleshooting
 
 - **`KeyError: 'rag.…'` right after a `git push`:** Streamlit reloaded the code while a session was open. Refresh the page, or use **Manage app → ⋮ → Reboot app**.
+- **Groq "Failed to parse tool call arguments":** the open model wrote malformed JSON. The app keeps every complete item, redoes the cut-off part in smaller pieces, and only shows an error if nothing could be read.
 - **Groq "Request too large" / "rate limit":** the free tier allows about 8,000 tokens per minute. Select fewer files under "Search within", wait a minute, or use Gemini or Claude for long filings.
 - Tested on Python 3.13 and 3.14 with pandas 3.
 

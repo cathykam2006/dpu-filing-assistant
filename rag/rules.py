@@ -21,6 +21,7 @@ import pandas as pd
 from .discovery import (GRADE_COLS, Figure, Issue, METRICS, add_unanswered, dedupe, ir_groups,
                         missing_attachments, verify)
 from .ingest import Chunk
+from .irformat import compose, label, pinpoint
 from .schedules import parse as parse_schedule
 
 # keyword -> metric, checked in order (first match wins)
@@ -188,59 +189,95 @@ def extract_figures(chunks: list[Chunk]) -> list[Figure]:
 # --------------------------------------------------------------------------
 # information requests from templates
 # --------------------------------------------------------------------------
-def _where(i: Issue) -> str:
-    return f"Refer to {i.locations[0]} of {i.file}. " if i.locations else (f"Refer to {i.file}. " if i.file else "")
-
-
 def draft_irs(figs: list[Figure], issues: list[Issue], text: str = "", prefix: str = "DPU",
-              set_no: int = 1, n: int = 10) -> pd.DataFrame:
+              set_no: int = 1, n: int = 10, refs: dict[str, str] | None = None,
+              schedules: list | None = None, own_docket: str = "") -> pd.DataFrame:
+    """Template requests in the Department's form. refs maps file name -> how to cite it
+    (e.g. 'the Company’s September 17, 2026 Peak GAF filing'); unknown files are cited as 'the Company’s filing'."""
+    refs = refs or {}
+    cite = lambda file, loc="": " ".join(x for x in (refs.get(file) or "the Company’s filing", pinpoint(loc)) if x)
+    any_ref = next(iter(refs.values()), "the Company’s filing")
     reqs: list[tuple[str, str, str, str]] = []           # topic, request, why, based on
     for i in issues:
+        loc = i.locations[0] if i.locations else ""
         if i.kind == "tie-out":
-            reqs.append(("Cost of gas tie-out", _where(i) + i.description.replace("but the stated", "while the stated")
-                         + " Please reconcile the difference and provide corrected schedules if needed.",
-                         "Automatic check: components do not sum to the total.", "; ".join(i.locations)))
+            reqs.append(("Cost of gas tie-out", compose(
+                cite(i.file, loc), i.description.replace("but the stated", "while the stated") + "  Please "
+                "reconcile the difference and provide corrected schedules, if necessary."),
+                "Automatic check: components do not sum to the total.", "; ".join(i.locations)))
+        elif i.kind == "formula":
+            m = re.match(r"Line (\d+) does not equal (.+?) for (.+)\.$", i.description)
+            line, formula, cols = m.groups() if m else ("", "", i.description)
+            reqs.append(("Schedule does not tie", compose(
+                cite(i.file, loc) + (f", Line {line}" if line else ""),
+                (f"Line {line} does not equal {formula} for the following rate classes: {cols}." if line
+                 else i.description) + "  Please explain the difference and provide a corrected schedule, if "
+                "necessary, with supporting workpapers."),
+                "Automatic check: a schedule formula does not tie.", "; ".join(i.locations)))
         elif i.kind == "large-change":
-            reqs.append(("Rate change", _where(i) + i.description + " Please identify and quantify each driver "
-                         "of the change, with supporting workpapers.",
-                         "Automatic check: change above the review threshold.", "; ".join(i.locations)))
+            reqs.append(("Rate change", compose(
+                cite(i.file, loc), i.description + "  Please identify and quantify each driver of the change, "
+                "and provide supporting workpapers."), "Automatic check: change above the review threshold.",
+                "; ".join(i.locations)))
         elif i.kind == "missing":
             if "reconciliation" in i.description:
-                reqs.append(("Reconciliation", "Please provide the prior-period reconciliation balance, with "
-                             "monthly gas costs and revenues, in Excel with formulas intact.",
-                             "Not found in the filing.", i.file))
+                reqs.append(("Reconciliation", compose(cite(i.file), "Please provide the prior-period "
+                             "reconciliation balance, with monthly gas costs and revenues, in Excel format with "
+                             "formulas intact."), "Not found in the filing.", i.file))
             elif "bill impact" in i.description:
-                reqs.append(("Bill impact", "Please provide typical bill impacts for each residential and C&I "
-                             "rate class under the proposed factors, by month for the period.",
-                             "Not found in the filing.", i.file))
+                reqs.append(("Bill impact", compose(cite(i.file), "Please provide typical bill impacts for each "
+                             "residential and commercial and industrial rate class under the proposed factors, "
+                             "by month."), "Not found in the filing.", i.file))
             elif "sales" in i.description:
-                reqs.append(("Sales forecast", "Please provide forecast sales by rate class and month, and "
-                             "describe the forecasting method and weather assumptions used.",
-                             "Not found in the filing.", i.file))
+                reqs.append(("Sales forecast", compose(cite(i.file), "Please provide", [
+                    "forecast sales by rate class and month", "a description of the forecasting method and "
+                    "weather assumptions used"]), "Not found in the filing.", i.file))
     comps = [f for f in figs if f.metric in ("commodity_cost", "demand_charges", "lng_cost", "reconciliation")]
     done = set()
     for f in sorted(comps, key=lambda f: (-f.value, f.location)):
         if (f.metric, f.value) in done:
             continue
         done.add((f.metric, f.value))
-        reqs.append((METRICS[f.metric].split(" (")[0],
-                     f"Refer to {f.location} of {f.file}. Please provide workpapers supporting \"{f.label}\" "
-                     f"(${f.value:,.0f}), in Excel with formulas intact, and explain the main assumptions.",
-                     "Material cost component.", f"{f.file} · {f.location}"))
-    if text and not re.search(r"hedg", text, re.I):
-        reqs.append(("Hedging", "Please describe the Company's hedging and fixed-price purchases for the "
-                     "period, including volumes, prices and their effect on the proposed factor.",
+        reqs.append((METRICS[f.metric].split(" (")[0], compose(
+            cite(f.file, f.location), f"The Company reports {f.label} of ${f.value:,.0f}.  Please provide",
+            ["all workpapers supporting this amount, in Excel format with formulas intact",
+             "an explanation of the main assumptions used"]), "Material cost component.", f"{f.file} · {f.location}"))
+    # schedule lines that rely on another docket: confirm the factors match what was approved or filed there
+    own = own_docket.upper().strip()
+    for file, loc, sch in schedules or []:
+        by_ref: dict[str, list] = {}
+        for r in sorted(sch.rows.values(), key=lambda r: r.line):
+            if not re.search(r"D\.\s?P\.\s?U\.", r.reference):
+                continue
+            tok = re.search(r"\b(\d{2}-[A-Z0-9][A-Z0-9-]*)", r.reference.upper())
+            if tok and own and tok.group(1).rstrip("-") == own:
+                continue                                      # the filing's own supporting section
+            by_ref.setdefault(tok.group(1) if tok else r.reference, []).append(r)
+        for _, rows in by_ref.items():
+            lines = [r.line for r in rows]
+            names = "; ".join(f"Line {r.line}, {re.sub(r'^[A-Z]{2,6}\s*=\s*', '', r.label).strip()}" for r in rows)
+            where = f"Line{'s' if len(lines) > 1 else ''} {', '.join(map(str, lines))}"
+            reqs.append((f"{where}: cited docket", compose(
+                f"{cite(file, loc)}, {where}",
+                f"The schedule cites “{rows[0].reference.strip()}” for {names}.  Please confirm that the factors "
+                f"shown on {where} for each rate class are the factors approved or filed in that proceeding.  If any "
+                "factor differs, please explain the difference and provide a corrected schedule."),
+                "The schedule relies on a factor set in another docket.", f"{file} · {loc}"))
+    gas_cost = any(f.metric in ("commodity_cost", "cost_of_gas_total", "demand_charges") for f in figs)
+    if text and gas_cost and not re.search(r"hedg", text, re.I):
+        reqs.append(("Hedging", compose(any_ref, "Please describe the Company’s hedging and fixed-price "
+                     "purchases for the period, including volumes, prices, and their effect on the proposed factor."),
                      "Hedging is not addressed in the filing.", ""))
-    if text and re.search(r"nymex|citygate|basis", text, re.I):
-        reqs.append(("Commodity forecast", "Please provide the NYMEX and basis price forecasts used to derive "
-                     "commodity costs, with the date and source of each.",
+    if text and gas_cost and re.search(r"nymex|citygate|basis", text, re.I):
+        reqs.append(("Commodity forecast", compose(any_ref, "Please provide the NYMEX and basis price forecasts "
+                     "used to derive commodity costs, with the date and source of each."),
                      "Commodity prices drive the cost of gas.", ""))
     seen, rows = set(), []
     for topic, req, why, src in reqs:
         if req in seen:
             continue
         seen.add(req)
-        rows.append({"No.": f"{prefix}-{set_no}-{len(rows) + 1}", "Topic": topic, "Request": req,
+        rows.append({"No.": label(prefix, set_no, len(rows) + 1), "Topic": topic, "Request": req,
                      "Why": why, "Based on": src})
         if len(rows) >= n:
             break

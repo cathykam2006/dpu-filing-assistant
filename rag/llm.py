@@ -30,6 +30,7 @@ class Provider:
     free: bool
     data_note: str
     history_turns: int = 6     # earlier chat turns sent with a question
+    tool_tokens: int = 4000    # output allowance for structured output (figures, requests), trimmed to fit
     request_tokens: int | None = None   # hard cap per request (input + output), if the provider has one
 
 
@@ -38,7 +39,7 @@ PROVIDERS = {
                      context_tokens=3_000, batch_tokens=2_500, max_tokens=1_200, free=True,
                      data_note="Excerpts are sent to Groq to generate results.",
                      # free tier: 8,000 tokens per minute, counting the requested output allowance
-                     history_turns=2, request_tokens=6_500),
+                     history_turns=2, request_tokens=6_500, tool_tokens=3_500),
     "gemini": Provider("Google Gemini", "GEMINI_API_KEY", "aistudio.google.com/apikey",
                        "https://generativelanguage.googleapis.com/v1beta/openai/",
                        context_tokens=25_000, batch_tokens=10_000, max_tokens=3_000, free=True,
@@ -94,6 +95,68 @@ def make_client(provider: str, key: str):
 def _to_openai_tool(tool: dict) -> dict:
     return {"type": "function", "function": {"name": tool["name"], "description": tool.get("description", ""),
                                              "parameters": tool["input_schema"]}}
+
+
+def _array_key(tool: dict) -> str | None:
+    props = tool.get("input_schema", {}).get("properties", {})
+    return next((k for k, v in props.items() if v.get("type") == "array"), None)
+
+
+def salvage(generation: str, tool: dict) -> dict | None:
+    """Recover the complete items from a malformed or cut-off tool call.
+    Open models sometimes repeat keys, misspell one, or run out of tokens mid-list; every item that is
+    itself valid JSON is kept, and the result is marked _partial so the caller can retry the rest."""
+    try:
+        whole = json.loads(generation)
+        args = whole.get("arguments", whole) if isinstance(whole, dict) else None
+        if isinstance(args, str):
+            args = json.loads(args)
+        if isinstance(args, dict):
+            return args
+    except (json.JSONDecodeError, TypeError):
+        pass
+    key = _array_key(tool)
+    if not key:
+        return None
+    m = re.search(r'"%s"\s*:\s*\[' % re.escape(key), generation)
+    if not m:
+        return None
+    items, depth, start, in_str, esc = [], 0, None, False, False
+    for i in range(m.end(), len(generation)):
+        ch = generation[i]
+        if in_str:
+            esc = (ch == "\\") and not esc
+            if ch == '"' and not esc:
+                in_str = False
+            continue
+        if ch == '"':
+            in_str, esc = True, False
+        elif ch == "{":
+            depth += 1
+            if depth == 1:
+                start = i
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    obj = json.loads(generation[start:i + 1])
+                    if isinstance(obj, dict):
+                        items.append(obj)
+                except json.JSONDecodeError:
+                    pass
+                start = None
+        elif ch == "]" and depth == 0:
+            return {key: items}
+    return {key: items, "_partial": True}
+
+
+def _failed_generation(e: Exception) -> str | None:
+    """Groq returns the model's unparseable tool call in the error body (code tool_use_failed)."""
+    body = getattr(e, "body", None)
+    err = body.get("error", body) if isinstance(body, dict) else None
+    if isinstance(err, dict) and err.get("code") == "tool_use_failed":
+        return str(err.get("failed_generation") or "")
+    return None
 
 
 def _json_from_text(text: str) -> dict | None:
@@ -172,6 +235,12 @@ class OpenAICompat:
         try:
             resp = self._c.chat.completions.create(**kw)
         except Exception as e:
+            gen = _failed_generation(e) if tools else None
+            if gen is not None:                       # malformed tool call: keep what is complete
+                data = salvage(gen, tools[0])
+                if data is not None:
+                    return NS(content=[NS(type="tool_use", name=tools[0]["name"], input=data)])
+                raise
             if tools and _is_bad_request(e):         # fall back to "auto" if forced choice is rejected
                 kw["tool_choice"] = "auto"
                 resp = self._c.chat.completions.create(**kw)
@@ -183,7 +252,8 @@ class OpenAICompat:
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
-                args = _json_from_text(tc.function.arguments) or {}
+                args = salvage(tc.function.arguments or "", tools[0]) if tools else None
+                args = args or _json_from_text(tc.function.arguments) or {}
             blocks.append(NS(type="tool_use", name=tc.function.name, input=args))
         if tools and not blocks:
             parsed = _json_from_text(msg.content or "")
@@ -218,6 +288,9 @@ def describe_error(e: Exception, provider: str) -> str:
         hint = " The free tier allows a limited number of tokens per minute; wait a minute and try again." \
             if p.free else " Wait a moment and try again."
         return f"{p.name} rate limit reached.{hint}"
+    if "tool_use_failed" in str(e):
+        return (f"{p.name}'s model returned output that could not be read. Try again, select fewer files, or "
+                "pick another model.")
     if kind == "NotFoundError":
         return (f"{p.name} did not recognise the model name. Set the correct id in the "
                 f"{'GROQ_MODEL' if provider == 'groq' else 'GEMINI_MODEL' if provider == 'gemini' else 'model'} "

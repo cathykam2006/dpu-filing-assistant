@@ -4,15 +4,33 @@ comparison) with every result traced to the page it came from."""
 from __future__ import annotations
 
 import hashlib
-import io
+import importlib
 import os
+import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from rag import answer, compliance, discovery, evaluate, ingest, llm, rules, schedules, search, verify
+_RAG = ["answer", "compliance", "discovery", "evaluate", "ingest", "irformat", "llm", "rules", "schedules", "search",
+        "verify"]
+
+
+def _load_rag():
+    """Import the rag package. If a code reload after a push left it half-loaded (KeyError 'rag.x',
+    or a module that is None), clear every rag module and import them fresh instead of failing."""
+    try:
+        return [importlib.import_module(f"rag.{m}") for m in _RAG]
+    except (KeyError, AttributeError, ImportError):
+        for name in [n for n in list(sys.modules) if n == "rag" or n.startswith("rag.")]:
+            sys.modules.pop(name, None)
+        importlib.invalidate_caches()
+        return [importlib.import_module(f"rag.{m}") for m in _RAG]
+
+
+answer, compliance, discovery, evaluate, ingest, irformat, llm, rules, schedules, search, verify = _load_rag()
 
 st.set_page_config(page_title="DPU Filing Assistant", page_icon="📑", layout="wide")
 
@@ -229,7 +247,8 @@ def figures_for(names: list[str]) -> list:
         cost = max(1, len(discovery._batches(numeric, P.batch_tokens, llm.estimate_tokens)))
         with st.spinner(f"Extracting figures from {n} …"):
             out = run_ai(lambda client: discovery.extract_figures(
-                client, model, rest, max_chars=P.batch_tokens, max_tokens=P.max_tokens, measure=llm.estimate_tokens), cost)
+                client, model, rest, max_chars=P.batch_tokens, max_tokens=P.tool_tokens, measure=llm.estimate_tokens),
+                cost)
         if out is None:
             break
         ss.figs[(h, MODE)] = discovery.dedupe(sched + out)
@@ -261,16 +280,15 @@ def show_number_checks(checks: list):
     st.markdown(md("\n".join(f"- **{c.number}** ({label[c.status]}): {c.detail}" for c in bad)))
 
 
-def docx_bytes(title: str, df: pd.DataFrame) -> bytes:
-    import docx
-    doc = docx.Document()
-    doc.add_heading(title, 1)
-    for _, r in discovery.clean_irs(df).iterrows():
-        doc.add_heading(f"Information Request {r['No.']}", 3)
-        doc.add_paragraph(r["Request"])
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
+def ir_meta() -> "irformat.IRSet":
+    return ss.get("ir_meta") or irformat.IRSet()
+
+
+def add_to_drafts(new: pd.DataFrame) -> int:
+    """Append requests to the Draft IRs table, numbered after the existing ones."""
+    base = ss.irs if ss.irs is not None else pd.DataFrame(columns=irformat.COLS)
+    ss.irs = pd.concat([base, new], ignore_index=True)
+    return len(new)
 
 
 SEV = {"high": "🔴", "medium": "🟠", "low": "⚪"}
@@ -448,20 +466,43 @@ with tabs[1]:
 # ================================================================== Draft IRs
 with tabs[2]:
     st.warning("Draft information requests are a starting point for staff review, built from public "
-               "filings for demonstration. Edit before use; issuing discovery follows DPU procedure.")
+               "filings for demonstration. Edit before use; issuing discovery follows DPU procedure. "
+               "Drafts are marked DRAFT and carry no seal or letterhead.")
     if not docs:
         st.info("Upload filings first.")
     else:
-        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-        target = c1.multiselect("Filings to review", [d.name for d in docs],
+        target = st.multiselect("Filings to review", [d.name for d in docs],
                                 default=[d.name for d in docs if d.doc_type != "Information request response"]
                                 or [d.name for d in docs], key="ir_files")
-        prefix = c2.text_input("Prefix", "DPU")
-        set_no = c3.number_input("Set", 1, 99, 1)
-        n_req = c4.number_input("Requests", 3, 25, 10)
-        use_checks = st.checkbox("Use automatic checks from the Key figures tab", value=True,
-                                 help="Issues found there (tie-outs, large changes, missing items) "
-                                      "become the first things asked about.")
+        tdocs = [by_name[n][1] for n in target]
+        first_pages = [verify.page_texts(d)[0][1] if verify.page_texts(d) else "" for d in tdocs]
+        st.markdown("**Set details**, as they appear in the title block: *SECOND SET OF INFORMATION "
+                    "REQUESTS OF THE DEPARTMENT OF PUBLIC UTILITIES TO … D.P.U. …*")
+        c1, c2, c3, c4, c5 = st.columns([2, 1.4, 0.7, 0.8, 1.1])
+        company = c1.text_input("Company", irformat.guess_company(first_pages), key="ir_company")
+        docket = c2.text_input("Docket (D.P.U. …)", irformat.guess_docket([k for d in tdocs for k in d.dockets],
+                                                                         first_pages),
+                               key="ir_docket")
+        set_no = c3.number_input("Set", 1, 20, 1, key="ir_set")
+        prefix = c4.text_input("Label", "DPU", key="ir_prefix",
+                               help="Requests are numbered “DPU 1-1”, “DPU 1-2” …; common sets use e.g. “DPU-LDC”.")
+        dated = c5.date_input("Dated", key="ir_date")
+        refs = {}
+        with st.expander("How each filing is cited in the requests (“Refer to …”)"):
+            st.caption("Edit to match the filing, e.g. “the Company’s September 17, 2026 Peak GAF filing”.")
+            for d in tdocs:
+                filed = compliance.filing_date([d])
+                refs[d.name] = st.text_input(d.name, irformat.default_reference(
+                    d.name, " ".join(t for _, t in verify.page_texts(d)), d.doc_type, filed[0] if filed else None),
+                    key=f"ref_{d.name}")
+        meta = irformat.IRSet(company.strip() or "the Company", docket.strip(), int(set_no), prefix.strip() or "DPU",
+                              irformat.long_date(dated))
+        ss.ir_meta, ss.ir_refs = meta, refs
+        c1, c2 = st.columns([1, 3])
+        n_req = c1.number_input("Requests", 3, 25, 10)
+        use_checks = c2.checkbox("Start from the automatic checks (Key figures tab)", value=True,
+                                 help="Issues found there (tie-outs, schedule formulas, large changes, missing "
+                                      "items) become the first requests.")
         if target and st.button("Draft information requests", type="primary"):
             issues = []
             if use_checks:
@@ -471,11 +512,14 @@ with tabs[2]:
             if AI:
                 with st.spinner("Drafting …"):
                     out = run_ai(lambda client: discovery.draft_irs(
-                        client, model, chunks_t, issues, prefix, int(set_no), int(n_req),
-                        max_chars=P.batch_tokens, max_tokens=P.max_tokens, measure=llm.estimate_tokens))
+                        client, model, chunks_t, issues, meta.prefix, meta.set_no, int(n_req),
+                        max_chars=P.batch_tokens, max_tokens=P.max_tokens, measure=llm.estimate_tokens, refs=refs))
             else:
                 out = rules.draft_irs(figures_for(target), issues, " ".join(c.text for c in chunks_t),
-                                      prefix, int(set_no), int(n_req))
+                                      meta.prefix, meta.set_no, int(n_req), refs=refs,
+                                      schedules=[(d.name, loc, sch) for d in tdocs
+                                                 for loc, sch in verify.document_schedules(d)],
+                                      own_docket=meta.docket)
             if out is not None:
                 ss.irs = out
         if not AI:
@@ -483,18 +527,28 @@ with tabs[2]:
                        "found (reconcile this total, explain this change, provide workpapers for this "
                        "component). A model writes requests tailored to the filing's content.")
         if ss.irs is not None and len(ss.irs):
-            st.caption("Edit directly in the table; downloads use your edits.")
+            st.caption("Edit directly in the table. Put each subpart on its own line starting “(a)”, “(b)” …; "
+                       "quotes, “percent”, sentence spacing and subpart punctuation are applied for you.")
             edited = st.data_editor(ss.irs, hide_index=True, width="stretch", num_rows="dynamic",
                                     key="ir_editor",
                                     column_config={"Request": st.column_config.TextColumn(width="large")})
-            edited = discovery.clean_irs(edited, prefix, int(set_no))     # blank or added rows
-            title = f"Information Requests — Set {int(set_no)}"
+            edited = irformat.clean(edited, meta)          # blank or added rows, and the format
+            problems = [(r["No."], note) for _, r in edited.iterrows() for note in irformat.lint(r["Request"])]
+            if problems:
+                st.warning(md(f"Format check: {len(problems)} point(s) to fix before issuing:\n" +
+                              "\n".join(f"- **{no}** {note}" for no, note in problems)))
+            elif len(edited):
+                st.success(f"Format check: all {len(edited)} requests cite the document and pinpoint first, make "
+                           "a “Please …” request, and use (a), (b) … subparts in the Department's form.")
+            with st.expander("Preview", expanded=False):
+                st.text(irformat.to_text(edited, meta))
+            stem = f"DPU_{meta.docket or 'docket'}_{meta.ordinal.title()}_Set_IRs_DRAFT".replace(" ", "_")
             d1, d2, d3 = st.columns(3)
-            d1.download_button("Word (.docx)", docx_bytes(title, edited), file_name="information_requests.docx")
-            d2.download_button("Text", discovery.irs_to_text(edited, title).encode(),
-                               file_name="information_requests.txt")
+            d1.download_button("Word (.docx), Department format", irformat.to_docx(edited, meta),
+                               file_name=f"{stem}.docx")
+            d2.download_button("Text", irformat.to_text(edited, meta).encode(), file_name=f"{stem}.txt")
             d3.download_button("CSV with rationale and sources", edited.to_csv(index=False).encode(),
-                               file_name="information_requests.csv")
+                               file_name=f"{stem}.csv")
 
 # ================================================================== Track responses
 with tabs[3]:
@@ -534,11 +588,17 @@ with tabs[3]:
                 col.metric(s.capitalize(), n)
             st.dataframe(g, hide_index=True, width="stretch")
             follow = g[g["Suggested follow-up"].astype(bool)]
-            if len(follow):
-                st.download_button("Download follow-up requests",
-                                   "\n\n".join(f"Follow-up to {r['IR']}: {r['Suggested follow-up']}"
-                                               for _, r in follow.iterrows()).encode(),
-                                   file_name="follow_up_requests.txt")
+            if len(follow) and st.button(f"Add {len(follow)} follow-up requests to the Draft IRs tab"):
+                m = ir_meta()
+                start = len(ss.irs) + 1 if ss.irs is not None else 1
+                new = pd.DataFrame([{
+                    "No.": irformat.label(m.prefix, m.set_no, start + i), "Topic": f"Follow-up to {r['IR']}",
+                    "Request": irformat.compose(
+                        "the Company’s response to information request " + re.sub(r"^([A-Z]+)-", r"\1 ", r["IR"]),
+                        str(r["Suggested follow-up"])),
+                    "Why": f"{r['Status']}: {r['Gaps']}".strip(": "), "Based on": r["Where"]}
+                    for i, (_, r) in enumerate(follow.iterrows())], columns=irformat.COLS)
+                st.success(f"Added {add_to_drafts(new)} requests. Open the Draft IRs tab to edit them.")
             st.download_button("Download tracker (CSV)", g.to_csv(index=False).encode(),
                                file_name="ir_response_tracker.csv")
 
@@ -659,11 +719,12 @@ with tabs[5]:
             c1.download_button("Download compliance table (CSV)", cdf.to_csv(index=False).encode(),
                                file_name="compliance_check.csv")
             if c2.button("Add follow-up IRs for every gap to the Draft IRs tab"):
-                base = ss.irs if ss.irs is not None else pd.DataFrame(columns=["No.", "Topic", "Request", "Why",
-                                                                              "Based on"])
-                new = compliance.follow_up_irs(cdf, "DPU", 1, len(base) + 1)
-                ss.irs = pd.concat([base, new], ignore_index=True)
-                st.success(f"Added {len(new)} draft requests. Open the Draft IRs tab to edit them.")
+                m = ir_meta()
+                refs = {d.name: compliance.order_reference(d) for d in order_docs}
+                filing_ref = next(iter((ss.get("ir_refs") or {}).values()), "the Company’s filing")
+                new = compliance.follow_up_irs(cdf, m.prefix, m.set_no,
+                                               (len(ss.irs) if ss.irs is not None else 0) + 1, refs, filing_ref)
+                st.success(f"Added {add_to_drafts(new)} draft requests. Open the Draft IRs tab to edit them.")
 
 # ================================================================== Evaluation
 with tabs[6]:

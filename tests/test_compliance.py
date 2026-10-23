@@ -120,7 +120,8 @@ def test_follow_up_irs_for_gaps():
     reqs = C.check([load("order_sample_98-PGAF-SAMPLE.pdf")], sample_filing())
     df = C.results_frame(reqs)
     irs = C.follow_up_irs(df, "DPU", 2, 4)
-    assert irs["No."].iloc[0] == "DPU-2-4" and len(irs) == (~df["Status"].str.startswith("✓")).sum()
+    assert irs["No."].iloc[0] == "DPU 2-4" and len(irs) == (~df["Status"].str.startswith("✓")).sum()
+    assert irs["Request"].iloc[0].startswith("Refer to order_sample_98-PGAF-SAMPLE.pdf at 1, which states: “")
     assert df["Status"].iloc[0] == "✗ Discrepancy"              # sorted worst first
 
 
