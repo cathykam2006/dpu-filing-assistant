@@ -98,8 +98,53 @@ def schedule_xlsx(path):
         df.to_excel(xw, sheet_name="Schedule 3", startrow=3, index=False)
 
 
+def sample_order(path):
+    """Fictional prior-year order with directives for the next filing (for the Compliance tab)."""
+    doc = SimpleDocTemplate(str(path), pagesize=letter)
+    p = [Paragraph(NOTE, ST["Italic"]),
+         Paragraph("D.P.U. 98-PGAF-SAMPLE", ST["Heading2"]),
+         Paragraph("Petition of Sample Gas Company for approval of its Peak Period Gas Adjustment Factor", ST["Heading3"]),
+         Paragraph("ORDER ON PEAK PERIOD GAS ADJUSTMENT FACTOR — October 30, 2025", ST["Heading3"]),
+         Paragraph("The Department has reviewed the Company's filing and responses to information requests. "
+                   "In its next peak period filing, the Company shall include a typical bill impact analysis "
+                   "for each rate class, including residential and C&amp;I customers.", ST["BodyText"]),
+         Paragraph("The Company shall provide monthly detail supporting any prior-period reconciliation "
+                   "balance as Attachment DPU-1-2, in Excel format with formulas intact.", ST["BodyText"]),
+         Paragraph("The Company is directed to report the percentage of forecast winter supply that is hedged "
+                   "and the weighted average hedge price.", ST["BodyText"]),
+         Paragraph("The Department approves a residential Local Distribution Adjustment Factor of $0.4310 per "
+                   "therm, effective November 1, 2026.", ST["BodyText"]),
+         Paragraph("The Company shall include Schedule 4, a summary of its hedging program, with each annual "
+                   "filing.", ST["BodyText"]),
+         Paragraph("Accordingly, after due notice, hearing and consideration, it is", ST["BodyText"]),
+         Paragraph("ORDERED: That the C&amp;I low load factor (G-51) Gas Adjustment Factor shall not exceed "
+                   "$0.8200 per therm for the 2026-2027 peak period; and it is", ST["BodyText"]),
+         Paragraph("FURTHER ORDERED: That Sample Gas Company shall file its 2026-2027 peak period filing no "
+                   "later than September 1, 2026.", ST["BodyText"]),
+         Paragraph("By Order of the Department (fictional).", ST["Italic"])]
+    doc.build(p)
+
+
+def sample_cover_letter(path):
+    doc = SimpleDocTemplate(str(path), pagesize=letter)
+    p = [Paragraph(NOTE, ST["Italic"]),
+         Paragraph("Sample Gas Company — Cover letter", ST["Heading2"]),
+         Paragraph("Re: D.P.U. 99-PGAF-SAMPLE, Peak Period Gas Adjustment Factor Filing", ST["BodyText"]),
+         Paragraph("Dear Secretary: Enclosed for filing please find the following:", ST["BodyText"])]
+    for item in ["Schedule 1 – Summary of Proposed Gas Adjustment Factors",
+                 "Schedule 2 – Cost of Gas Components",
+                 "Schedule 3 – Monthly Forecast Sales and Commodity Cost",
+                 "Schedule 4 – Hedging Program Summary",
+                 "Attachment A – Typical Bill Impacts by Rate Class"]:
+        p.append(Paragraph(item, ST["BodyText"]))
+    p.append(Paragraph("Thank you for your attention to this matter.", ST["BodyText"]))
+    doc.build(p)
+
+
 if __name__ == "__main__":
     gaf_filing(OUT / "sample_pgaf_filing.pdf")
     ir_responses(OUT / "sample_ir_responses.pdf")
     schedule_xlsx(OUT / "sample_schedule3.xlsx")
+    sample_order(OUT / "order_sample_98-PGAF-SAMPLE.pdf")
+    sample_cover_letter(OUT / "order_sample_cover_letter.pdf")
     print("Samples written to", OUT)

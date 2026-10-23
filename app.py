@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from rag import answer, discovery, evaluate, ingest, llm, rules, schedules, search, verify
+from rag import answer, compliance, discovery, evaluate, ingest, llm, rules, schedules, search, verify
 
 st.set_page_config(page_title="DPU Filing Assistant", page_icon="📑", layout="wide")
 
@@ -48,6 +48,10 @@ ss.setdefault("unlocked", not secret("APP_PASSWORD"))
 ss.setdefault("upload_key", 0)
 ss.setdefault("use_samples", False)
 ss.setdefault("use_real", False)
+ss.setdefault("orders", {})            # file hash -> Document (orders / cover letters)
+ss.setdefault("order_key", 0)
+ss.setdefault("use_sample_order", False)
+ss.setdefault("compliance", None)      # DataFrame of compliance results
 ss.setdefault("figs", {})          # (file hash, model) -> list[Figure]
 ss.setdefault("irs", None)         # DataFrame of drafted IRs
 ss.setdefault("grades", None)      # DataFrame of graded responses
@@ -101,6 +105,8 @@ with st.sidebar:
         for k in ("docs", "figs"):
             ss[k] = {}
         ss.chat, ss.use_samples, ss.use_real, ss.irs, ss.grades, ss.eval = [], False, False, None, None, None
+        ss.orders, ss.use_sample_order, ss.compliance = {}, False, None
+        ss.order_key += 1
         ss.upload_key += 1          # resets the drag-and-drop box
         st.rerun()
     st.divider()
@@ -270,7 +276,7 @@ def docx_bytes(title: str, df: pd.DataFrame) -> bytes:
 SEV = {"high": "🔴", "medium": "🟠", "low": "⚪"}
 
 tabs = st.tabs(["💬 Ask", "🔢 Key figures & checks", "📝 Draft IRs", "📬 Track responses",
-                "↔️ Compare filings", "🎯 Evaluation"])
+                "↔️ Compare filings", "✅ Compliance", "🎯 Evaluation"])
 
 # ================================================================== Ask
 with tabs[0]:
@@ -561,8 +567,106 @@ with tabs[4]:
                 st.download_button("Download comparison (CSV)", cmp.to_csv(index=False).encode(),
                                    file_name="filing_comparison.csv")
 
-# ================================================================== Evaluation
+# ================================================================== Compliance
 with tabs[5]:
+    st.markdown("Drop in the **Department's order**, a **prior order**, or the filing's **cover letter**. "
+                "Each directive, approved value, required schedule or attachment and deadline is pulled out "
+                "and checked against the filing above. Values, schedules, attachments and dates are checked by "
+                "code: a value that differs from the order, or one over a cap the order sets, is always "
+                "flagged as a discrepancy." + (f" **{model_label}** also judges each requirement against the "
+                "filing and quotes its evidence." if AI else " In no-AI mode, requirements without a concrete "
+                "value or document are marked for review with the most relevant filing passage."))
+    oup = st.file_uploader("Department order, prior order or cover letter",
+                           type=[e.lstrip(".") for e in ingest.SUPPORTED], accept_multiple_files=True,
+                           key=f"orders_{ss.order_key}")
+    cur_o = set()
+    for f in oup or []:
+        data = f.getvalue()
+        h = hashlib.sha1(data).hexdigest()
+        cur_o.add(h)
+        if h not in ss.orders:
+            try:
+                ss.orders[h] = ingest.load(f.name, data)
+            except Exception as e:
+                st.error(f"{f.name}: could not be read ({e}).")
+    if ss.use_sample_order:
+        for pth in sorted(SAMPLES.glob("order_sample_*.pdf")):
+            data = pth.read_bytes()
+            h = hashlib.sha1(data).hexdigest()
+            cur_o.add(h)
+            if h not in ss.orders:
+                ss.orders[h] = ingest.load(pth.name, data)
+    ss.orders = {h: d for h, d in ss.orders.items() if h in cur_o}
+    order_docs = list(ss.orders.values())
+    if not order_docs:
+        if st.button("Or use a fictional sample order and cover letter (load the three sample filings above first)"):
+            ss.use_sample_order = True
+            st.rerun()
+    else:
+        st.caption("Order documents: " + ", ".join(d.name for d in order_docs))
+    if not docs:
+        st.info("Upload the filing to check in the box at the top of the page.")
+    elif order_docs:
+        filing_pick = st.multiselect("Filing to check", [d.name for d in docs], default=[d.name for d in docs],
+                                     key="comp_files")
+        if filing_pick and st.button("Check the filing against the order", type="primary"):
+            filing_docs = [by_name[n][1] for n in filing_pick]
+            if AI:
+                n_req = len(compliance.extract_requirements(order_docs))
+                cost = len(discovery._batches([c for d in order_docs for c in d.chunks], P.batch_tokens,
+                                              llm.estimate_tokens)) + max(1, -(-n_req // 3))
+                with st.spinner("Reading the order and checking the filing …"):
+                    reqs = run_ai(lambda client: compliance.check(
+                        order_docs, filing_docs, client, model, index, P.batch_tokens, P.max_tokens,
+                        llm.estimate_tokens, filing_pick), cost)
+            else:
+                reqs = compliance.check(order_docs, filing_docs, index=index)
+            if reqs is not None:
+                ss.compliance = compliance.results_frame(reqs, index, filing_pick)
+        if ss.compliance is not None and len(ss.compliance):
+            cdf = ss.compliance
+            st_ = cdf["Status"]
+            disc = cdf[st_ == "✗ Discrepancy"]
+            gaps = cdf[st_.isin(["✗ Not met", "✗ Not provided", "? Not found"])]
+            part = cdf[st_.isin(["◐ Partly met", "? Review"])]
+            ok = cdf[st_.str.startswith("✓")]
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Requirements", len(cdf))
+            m2.metric("✗ Discrepancies", len(disc))
+            m3.metric("✗ Not met / missing", len(gaps))
+            m4.metric("◐ Partly met / review", len(part))
+            m5.metric("✓ Met / found", len(ok))
+            if len(disc):
+                st.subheader("Discrepancies")
+                for _, r in disc.iterrows():
+                    st.error(md(f"**{r['ID']}** · {r['Requirement']}\n\n**What differs:** "
+                                f"{r['Discrepancy / what to check']}\n\n*Order: {r['From']}*"))
+            if len(gaps):
+                st.subheader("Not met or missing")
+                for _, r in gaps.iterrows():
+                    st.warning(md(f"**{r['ID']}** · {r['Status']} · {r['Requirement']}\n\n"
+                                  f"{r['Discrepancy / what to check']}\n\n*Order: {r['From']}*"))
+            if len(part):
+                st.subheader("Partly met or needs review")
+                for _, r in part.iterrows():
+                    ev = f"\n\nClosest filing passage ({r['Where in filing']}): {r['Filing evidence'][:250]}" \
+                        if r["Filing evidence"] else ""
+                    st.info(md(f"**{r['ID']}** · {r['Status']} · {r['Requirement']}\n\n"
+                               f"{r['Discrepancy / what to check']}{ev}\n\n*Order: {r['From']}*"))
+            with st.expander(f"All requirements ({len(cdf)})", expanded=not (len(disc) or len(gaps))):
+                st.dataframe(cdf, hide_index=True, width="stretch")
+            c1, c2 = st.columns(2)
+            c1.download_button("Download compliance table (CSV)", cdf.to_csv(index=False).encode(),
+                               file_name="compliance_check.csv")
+            if c2.button("Add follow-up IRs for every gap to the Draft IRs tab"):
+                base = ss.irs if ss.irs is not None else pd.DataFrame(columns=["No.", "Topic", "Request", "Why",
+                                                                              "Based on"])
+                new = compliance.follow_up_irs(cdf, "DPU", 1, len(base) + 1)
+                ss.irs = pd.concat([base, new], ignore_index=True)
+                st.success(f"Added {len(new)} draft requests. Open the Draft IRs tab to edit them.")
+
+# ================================================================== Evaluation
+with tabs[6]:
     st.markdown("How often is the assistant right? Load a question set with known answers "
                 "(a CSV: `id, question, files, expected_values, expected_location`), then score "
                 "retrieval (free) or full answers and citations, optionally against a whole-document "

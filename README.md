@@ -27,7 +27,7 @@ The app picks the first provider with a key in Secrets (Groq, then Claude, then 
   - Docket numbers (e.g. D.P.U. 25-PGAF-GRID) and document type (GAF filing, rate case, IR response) are detected automatically.
 - **Cited answers:** the model answers only from the retrieved excerpts, quotes figures exactly as filed, flags conflicts between an original and a revision, and says so when the filings don't contain the answer. Click "Sources cited" to read each excerpt.
 - **Scope and export:** limit questions to selected files, and download the Q&A with citations.
-- **Try it without your own files:** one click loads three fictional sample filings, or a real public NSTAR Gas LDAC filing.
+- **Try it without your own files:** one click loads three fictional sample filings, or a real public NSTAR Gas LDAC filing. The Compliance tab has a fictional sample order and cover letter to check the sample filings against.
 
 ## Verification: no unflagged mistakes, no silent misses
 
@@ -51,6 +51,7 @@ Tested on a real public filing included in `samples/`: NSTAR Gas LDAC, D.P.U. 26
 | **Draft IRs** | Numbered requests (e.g. DPU-1-1…) in DPU style, each with a rationale and the page that prompted it; edit in the table, download as Word, text or CSV | The model drafts, starting from the automatic findings; in no-AI mode, templates are filled from the checks and figures |
 | **Track responses** | For each IR response: answered / partial / non-responsive / objection / refers to attachment, gaps, attachments not yet uploaded, suggested follow-up; drafted IRs with no response are flagged | The model grades; in no-AI mode, rules flag objections, deferrals and short answers. Attachment and no-response checks are always code |
 | **Compare filings** | Last year's vs this year's filing, figure by figure, with change and the page for each number | Join and arithmetic are code |
+| **Compliance** | Drop in the Department's order, a prior order or the filing's cover letter. Every directive ("shall", "is directed to", "ORDERED: That…"), approved value, cap, required schedule or attachment, deadline and enclosure is checked against the filing, and discrepancies are listed first. Gaps become draft IRs in one click | Code checks every value (in the right rate-class column, including caps and floors), document (actually provided, not just mentioned) and date. The model judges each requirement with a quote from the filing that is checked to be verbatim. If the model says "met" but the code check disagrees, or gives no quote, the requirement is flagged, not passed |
 
 Draft IRs are a starting point for staff review. This demo is intended for public filings.
 
@@ -91,12 +92,13 @@ question → keyword search (BM25) tuned for docket/IR numbers, rate classes and
 | `rag/llm.py` | Providers (Groq, Gemini, Anthropic), size budgets, OpenAI-compatible adapter, error messages |
 | `rag/answer.py` | Prompt, streaming answer, citation parsing |
 | `rag/schedules.py`, `rag/verify.py` | Schedule parser, formula checks, coverage report, answer number check |
+| `rag/compliance.py` | Requirements from orders and cover letters, code checks, model judgement, combined status, follow-up IRs |
 | `rag/rules.py` | No-AI mode: pattern-based figures, template IRs, response checks, passage highlighting |
 | `rag/discovery.py` | Figure extraction (tool use + verbatim verification), checks, IR drafting, response grading, comparison |
 | `rag/evaluate.py`, `eval/` | Question sets, scoring, baseline, reports |
 | `app.py` | Streamlit interface: upload, Ask, Key figures, Draft IRs, Track responses, Compare, Evaluation |
 | `samples/` | Fictional sample filings (`make_samples.py` regenerates them) |
-| `tests/` | 45 tests on ingestion, search, prompts, discovery, scoring, the Groq/Gemini adapter, no-AI mode and verification (the API is faked, so tests are free) |
+| `tests/` | 53 tests on ingestion, search, prompts, discovery, scoring, the Groq/Gemini adapter, no-AI mode, verification and compliance checks (the API is faked, so tests are free) |
 
 Scanned PDFs without a text layer are flagged; run OCR first for those pages to be searchable.
 
