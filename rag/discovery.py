@@ -462,7 +462,8 @@ def compare(figs: list[Figure], prior_file: str, current_file: str) -> pd.DataFr
     pick = lambda f: (df[df["file"] == f].sort_values("r").drop_duplicates(key)
                       .set_index(key)[["label", "value", "unit", "location"]])
     a, b = pick(prior_file), pick(current_file)
-    out = a.join(b, how="outer", lsuffix=" (prior)", rsuffix=" (current)").reset_index()
+    out = a.merge(b, how="outer", left_index=True, right_index=True,
+                  suffixes=(" (prior)", " (current)")).reset_index()
     out["Change"] = out["value (current)"] - out["value (prior)"]
     out["Change %"] = out["Change"] / out["value (prior)"].abs() * 100
     out["Metric"] = out["metric"].map(METRICS).fillna(out["metric"])

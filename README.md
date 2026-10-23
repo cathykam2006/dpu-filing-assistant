@@ -118,6 +118,12 @@ streamlit run app.py
 3. In **App settings → Secrets**, add any of `GROQ_API_KEY` (free, console.groq.com/keys), `GEMINI_API_KEY` or `ANTHROPIC_API_KEY`. You can also add none, and the app runs in no-AI mode. Optional: `DEFAULT_MODEL`, `APP_PASSWORD`, `MAX_QUESTIONS` (see `.streamlit/secrets.toml.example`). `MAX_QUESTIONS` caps AI requests per session on your keys. Visitors who paste their own key are not capped.
 4. For a paid key (Anthropic), set a monthly spend limit in the provider's console.
 
+## Troubleshooting
+
+- **`KeyError: 'rag.…'` right after a `git push`:** Streamlit reloaded the code while a session was open. Refresh the page, or use **Manage app → ⋮ → Reboot app**.
+- **Groq "Request too large" / "rate limit":** the free tier allows about 8,000 tokens per minute. Select fewer files under "Search within", wait a minute, or use Gemini or Claude for long filings.
+- Tested on Python 3.13 and 3.14 with pandas 3.
+
 ## Limitations and next steps
 
 - Keyword search can miss paraphrases (e.g. "hedging" vs. "fixed-price purchases"); adding embedding-based search alongside BM25 would help.
