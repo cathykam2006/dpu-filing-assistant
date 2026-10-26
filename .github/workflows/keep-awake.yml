@@ -1,0 +1,32 @@
+name: Keep Streamlit app awake
+
+# Streamlit Community Cloud sleeps apps after a stretch with no visitors.
+# This opens the app in a headless browser every 6 hours and wakes it if needed.
+on:
+  schedule:
+    - cron: "17 */6 * * *"     # every 6 hours (UTC), off the top of the hour
+  workflow_dispatch:            # "Run workflow" button in the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright==1.47.0
+          python -m playwright install --with-deps chromium
+
+      - name: Visit the app
+        env:
+          APP_URL: https://dpu-filing-assistant-6tsrcudhmux8mpakqcnlux.streamlit.app/
+        run: python scripts/keep_awake.py
