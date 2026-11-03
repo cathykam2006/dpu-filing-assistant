@@ -52,8 +52,23 @@ def visible_text(page, limit=600):
 
 def main():
     with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        # Look like a regular desktop Chrome: Streamlit Cloud may refuse to
+        # serve its app code to an obviously headless browser.
+        browser = p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 900}, locale="en-US",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"))
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        page = context.new_page()
+        problems = []
+        page.on("requestfailed", lambda r: problems.append(
+            f"failed: {r.url[:120]} ({r.failure})"))
+        page.on("response", lambda r: problems.append(f"HTTP {r.status}: {r.url[:120]}")
+                if r.status >= 400 else None)
+        page.on("console", lambda m: problems.append(f"console {m.type}: {m.text[:200]}")
+                if m.type == "error" else None)
         print(f"Opening {URL}")
         resp = page.goto(URL, wait_until="domcontentloaded", timeout=90_000)
         print(f"HTTP status: {resp.status if resp else 'none'}")
@@ -85,6 +100,8 @@ def main():
             print(f"Final URL: {page.url}")
             print(f"Page title: {page.title()!r}")
             print(f"Page shows: {visible_text(page)}")
+            for line in problems[:15]:
+                print(f"  {line}")
         try:
             page.screenshot(path="keep_awake.png", full_page=True)
         except Exception:  # noqa: BLE001
