@@ -1,0 +1,41 @@
+name: Sync to Hugging Face Space
+
+# Copies the app to a Hugging Face Space after every push to main, so the app
+# also runs at https://<your-hf-username>-dpu-filing-assistant.hf.space
+# Needs the repo secret HF_TOKEN (Hugging Face write token). Until it is set,
+# the job does nothing and passes.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hf-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install "huggingface_hub>=0.25"
+
+      - name: Upload to the Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE: dpu-filing-assistant
+          HF_TITLE: DPU Filing Assistant
+          HF_EMOJI: "📑"
+          HF_SHORT: Q&A, key figures and draft IRs for public DPU filings
+          APP_FILE: app.py
+          HF_EXCLUDE: tests,requirements-dev.txt,scripts,eval/results
+        run: python .github/scripts/sync_to_hf.py
