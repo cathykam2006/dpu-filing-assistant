@@ -13,7 +13,7 @@ permissions:
 jobs:
   wake:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -30,3 +30,12 @@ jobs:
         env:
           APP_URL: https://dpu-filing-assistant-6tsrcudhmux8mpakqcnlux.streamlit.app/
         run: python scripts/keep_awake.py
+
+      - name: Save screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keep-awake-screenshot
+          path: keep_awake.png
+          retention-days: 3
+          if-no-files-found: ignore
