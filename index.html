@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>DPU Filing Assistant | Cathy Kam</title>
+  <meta name="description" content="Search utility filings, pull key figures with automatic checks, draft information requests and compare filings. Runs entirely in your browser; files never leave your device. Built by Cathy Kam." />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📑</text></svg>" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/browser@1.12.3/build/stlite.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <noscript>This app runs Python in your browser, so it needs JavaScript turned on.</noscript>
+  <script type="module">
+    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@1.12.3/build/stlite.js";
+
+    // app.py, the rag/ package and the sample filings come straight from the main
+    // branch, so changes pushed there show up here automatically. static_entry.py
+    // (on this branch) limits the model menu to No-AI mode, then runs app.py.
+    const RAW = "https://raw.githubusercontent.com/cathykam2006/dpu-filing-assistant/main/";
+    const FROM_MAIN = [
+      "app.py",
+      ...["__init__", "answer", "compliance", "discovery", "evaluate", "ingest", "irformat",
+          "llm", "rules", "schedules", "search", "verify"].map((m) => `rag/${m}.py`),
+      "samples/order_sample_98-PGAF-SAMPLE.pdf",
+      "samples/order_sample_cover_letter.pdf",
+      "samples/real_NSTAR_Gas_LDAC_DPU_26-PGAF-NSTAR_corrected.pdf",
+      "samples/sample_ir_responses.pdf",
+      "samples/sample_pgaf_filing.pdf",
+      "samples/sample_schedule3.xlsx",
+    ];
+    const files = { "static_entry.py": { url: "./static_entry.py" } };
+    for (const path of FROM_MAIN) files[path] = { url: RAW + path };
+
+    mount(
+      {
+        entrypoint: "static_entry.py",
+        requirements: ["pandas", "openpyxl", "python-docx", "rank-bm25", "pypdfium2"],
+        files,
+        // Same theme as .streamlit/config.toml on main
+        streamlitConfig: {
+          "theme.base": "light",
+          "theme.primaryColor": "#2a78d6",
+          "theme.backgroundColor": "#fcfcfb",
+          "theme.secondaryBackgroundColor": "#f3f2ee",
+          "theme.textColor": "#0b0b0b",
+          "server.maxUploadSize": 50,
+          "client.toolbarMode": "viewer",
+        },
+      },
+      document.getElementById("root"),
+    );
+  </script>
+</body>
+</html>
